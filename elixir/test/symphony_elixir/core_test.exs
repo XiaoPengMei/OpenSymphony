@@ -700,6 +700,313 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  test "normal worker exit with completion marker moves active issue to review without retry" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-exit-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-complete-exit"
+    issue_identifier = "MT-562"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletionExitOrchestrator)
+
+    try do
+      workspace = Path.join(test_root, issue_identifier)
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/complete"), "done\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: issue_identifier, title: "Finished", state: "In Progress"}
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 1_000
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}, 1_000
+      assert comment =~ "moved this issue to `In Review`"
+
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      assert MapSet.member?(state.completed, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "normal worker exit with stale active state does not move issue to review" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-stale-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-complete-stale"
+    issue_identifier = "MT-565"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletionStaleOrchestrator)
+
+    try do
+      workspace = Path.join(test_root, issue_identifier)
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/complete"), "done\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: issue_identifier, title: "Already done", state: "Done"}
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      refute Map.has_key?(state.retry_attempts, issue_id)
+      refute_received {:memory_tracker_state_update, ^issue_id, "In Review"}
+      refute_received {:memory_tracker_comment, ^issue_id, _comment}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "normal worker exit ignores directory and symlink completion markers" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-invalid-marker-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-invalid-marker"
+    issue_identifier = "MT-566"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletionInvalidMarkerOrchestrator)
+
+    try do
+      workspace = Path.join(test_root, issue_identifier)
+      File.mkdir_p!(Path.join(workspace, ".symphony/complete"))
+      outside_marker = Path.join(test_root, "outside-complete")
+      File.write!(outside_marker, "done\n")
+      File.ln_s!(outside_marker, Path.join(workspace, ".symphony/symlink-complete"))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true,
+        completion_marker_path: ".symphony/complete"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: issue_identifier, title: "Invalid marker", state: "In Progress"}
+      ])
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      assert %{attempt: 1} = state.retry_attempts[issue_id]
+      refute_received {:memory_tracker_state_update, ^issue_id, "In Review"}
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true,
+        completion_marker_path: ".symphony/symlink-complete"
+      )
+
+      symlink_issue_id = "issue-invalid-symlink-marker"
+      symlink_ref = make_ref()
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: symlink_issue_id, identifier: issue_identifier, title: "Invalid symlink marker", state: "In Progress"}
+      ])
+
+      running_entry = %{running_entry | ref: symlink_ref, issue: %Issue{id: symlink_issue_id, identifier: issue_identifier, state: "In Progress"}}
+
+      :sys.replace_state(pid, fn current_state ->
+        current_state
+        |> Map.put(:running, %{symlink_issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([symlink_issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, symlink_ref, :process, self(), :normal})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      assert %{attempt: 1} = state.retry_attempts[symlink_issue_id]
+      refute_received {:memory_tracker_state_update, ^symlink_issue_id, "In Review"}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "abnormal worker exit with completion marker still follows retry path" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-completion-crash-#{System.unique_integer([:positive])}")
+    issue_id = "issue-complete-crash"
+    issue_identifier = "MT-563"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :CompletionCrashOrchestrator)
+
+    try do
+      workspace = Path.join(test_root, issue_identifier)
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/complete"), "done\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        completion_enabled: true
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        identifier: issue_identifier,
+        issue: %Issue{id: issue_id, identifier: issue_identifier, state: "In Progress"},
+        workspace_path: workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      :sys.replace_state(pid, fn _ ->
+        initial_state
+        |> Map.put(:running, %{issue_id => running_entry})
+        |> Map.put(:claimed, MapSet.new([issue_id]))
+        |> Map.put(:retry_attempts, %{})
+      end)
+
+      send(pid, {:DOWN, ref, :process, self(), :boom})
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+
+      assert %{attempt: 1, error: "agent exited: :boom"} = state.retry_attempts[issue_id]
+      refute_received {:memory_tracker_state_update, ^issue_id, "In Review"}
+      refute_received {:memory_tracker_comment, ^issue_id, _comment}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "continuation retry cleans workspace when issue is terminal" do
     test_root =
       Path.join(
@@ -754,6 +1061,66 @@ defmodule SymphonyElixir.CoreTest do
       refute Map.has_key?(updated_state.retry_attempts, issue_id)
       refute File.exists?(workspace)
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "continuation retry with completion marker moves active issue to review" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-retry-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-complete-retry"
+    issue_identifier = "MT-564"
+    retry_token = make_ref()
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/complete"), "done\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: issue_identifier, title: "Finished retry", state: "In Progress"}
+      ])
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{
+          issue_id => %{
+            attempt: 1,
+            retry_token: retry_token,
+            timer_ref: nil,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: issue_identifier,
+            worker_host: nil,
+            workspace_path: workspace,
+            delay_type: :continuation
+          }
+        },
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      assert {:noreply, updated_state} =
+               Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Map.has_key?(updated_state.retry_attempts, issue_id)
+      assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 1_000
+      assert_receive {:memory_tracker_comment, ^issue_id, _comment}, 1_000
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
       File.rm_rf(test_root)
     end
   end

@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{Accounts, AgentRoute, AgentRunner, Config, IssueConfig, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{Accounts, AgentRoute, AgentRunner, CompletionEnforcer, Config, IssueConfig, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -146,19 +146,7 @@ defmodule SymphonyElixir.Orchestrator do
             :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(
-                issue_id,
-                1,
-                %{
-                  identifier: running_entry.identifier,
-                  delay_type: :continuation,
-                  worker_host: Map.get(running_entry, :worker_host),
-                  workspace_path: Map.get(running_entry, :workspace_path)
-                }
-                |> Map.merge(retry_issue_metadata(running_entry))
-              )
+              handle_normal_worker_exit_completion(state, issue_id, running_entry)
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -1018,7 +1006,16 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata)
+        case maybe_enforce_completion(issue, metadata[:workspace_path]) do
+          {:ok, :completed} ->
+            {:noreply,
+             state
+             |> complete_issue(issue_id)
+             |> release_issue_claim(issue_id)}
+
+          _ ->
+            handle_active_retry(state, issue, attempt, metadata)
+        end
 
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
@@ -1031,6 +1028,92 @@ defmodule SymphonyElixir.Orchestrator do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
     {:noreply, release_issue_claim(state, issue_id)}
   end
+
+  defp handle_normal_worker_exit_completion(state, issue_id, running_entry) do
+    metadata =
+      %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      }
+      |> Map.merge(retry_issue_metadata(running_entry))
+
+    if !Config.settings!().completion.enabled do
+      schedule_continuation_retry(state, issue_id, metadata)
+    else
+      enforce_revalidated_completion(state, issue_id, metadata)
+    end
+  end
+
+  defp enforce_revalidated_completion(state, issue_id, metadata) do
+    case fetch_current_issue_for_completion(issue_id) do
+      {:ok, %Issue{} = issue} ->
+        case maybe_enforce_completion(issue, metadata.workspace_path) do
+          {:ok, :completed} ->
+            state
+            |> complete_issue(issue_id)
+            |> release_issue_claim(issue_id)
+
+          _ ->
+            schedule_continuation_retry(state, issue_id, metadata)
+        end
+
+      {:skip, %Issue{} = issue} ->
+        Logger.debug("Issue left active states before completion enforcement, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {:skip, :missing} ->
+        Logger.debug("Issue no longer visible before completion enforcement, removing claim issue_id=#{issue_id}")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      {:error, reason} ->
+        Logger.warning("Completion revalidation failed for issue_id=#{issue_id} issue_identifier=#{metadata.identifier}: #{inspect(reason)}; scheduling continuation retry")
+        schedule_continuation_retry(state, issue_id, metadata)
+    end
+  end
+
+  defp fetch_current_issue_for_completion(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, issues} ->
+        case find_issue_by_id(issues, issue_id) do
+          %Issue{} = issue ->
+            if retry_candidate_issue?(issue, terminal_state_set()) do
+              {:ok, issue}
+            else
+              {:skip, issue}
+            end
+
+          nil ->
+            {:skip, :missing}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp schedule_continuation_retry(state, issue_id, metadata) do
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, metadata)
+  end
+
+  defp maybe_enforce_completion(%{issue: %Issue{} = issue}, workspace_path) do
+    maybe_enforce_completion(issue, workspace_path)
+  end
+
+  defp maybe_enforce_completion(%Issue{} = issue, workspace_path) do
+    CompletionEnforcer.enforce(issue, workspace_path, Config.settings!())
+  end
+
+  defp maybe_enforce_completion(_issue_or_entry, _workspace_path), do: {:ok, :missing_workspace}
 
   defp cleanup_issue_workspace(issue_or_identifier, worker_host \\ nil)
 

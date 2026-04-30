@@ -88,11 +88,11 @@ defmodule SymphonyElixir.IssueConfig do
         :backend,
         :default_effort,
         :max_concurrent_agents,
-        :max_turns,
         :max_retry_backoff_ms,
         :max_concurrent_agents_by_state
       ])
       |> Map.put(:backend, project_route.backend || workflow.agent.backend || settings.agent.backend)
+      |> put_bounded_max_turns(settings.agent.max_turns, workflow.agent.max_turns)
 
     %{
       settings
@@ -137,6 +137,21 @@ defmodule SymphonyElixir.IssueConfig do
       end
     end)
   end
+
+  defp put_bounded_max_turns(agent, global_max_turns, workflow_max_turns)
+       when is_integer(global_max_turns) and is_integer(workflow_max_turns) do
+    Map.put(agent, :max_turns, min(global_max_turns, workflow_max_turns))
+  end
+
+  defp put_bounded_max_turns(agent, global_max_turns, _workflow_max_turns) when is_integer(global_max_turns) do
+    Map.put(agent, :max_turns, global_max_turns)
+  end
+
+  defp put_bounded_max_turns(agent, _global_max_turns, workflow_max_turns) when is_integer(workflow_max_turns) do
+    Map.put(agent, :max_turns, workflow_max_turns)
+  end
+
+  defp put_bounded_max_turns(agent, _global_max_turns, _workflow_max_turns), do: agent
 
   defp prompt_template(prompt) when is_binary(prompt) do
     if String.trim(prompt) == "" do

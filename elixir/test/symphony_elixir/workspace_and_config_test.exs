@@ -1851,6 +1851,47 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "issue config does not let project workflow widen global max turns" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-config-max-turns-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_root = Path.join(test_root, "project-b")
+      config_path = Path.join(test_root, "symphony.yml")
+
+      init_repo!(repo_root, "project b\n")
+
+      write_project_workflow_repo_file!(repo_root, "WORKFLOW.md",
+        max_turns: 8,
+        prompt: "Project prompt for {{ issue.identifier }}"
+      )
+
+      write_symphony_config_file!(config_path,
+        max_turns: 1,
+        projects: [
+          %{
+            linear_project: "project-b",
+            repo: repo_root,
+            workflow: "./WORKFLOW.md"
+          }
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      issue = %Issue{identifier: "AP-43", title: "Bound turns", project_slug: "project-b"}
+
+      assert {:ok, issue_config} = SymphonyElixir.IssueConfig.resolve(issue)
+      assert issue_config.settings.agent.max_turns == 1
+      assert PromptBuilder.build_prompt(issue, issue_config: issue_config) == "Project prompt for AP-43"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "issue config and workspace honor a project's configured default branch" do
     test_root =
       Path.join(

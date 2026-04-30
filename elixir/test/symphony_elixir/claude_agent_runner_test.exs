@@ -78,6 +78,65 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
     end
   end
 
+  test "agent runner stops after one turn when issue leaves active states" do
+    test_root = temp_root!("nonactive-stop")
+    trace_env = "SYMP_TEST_CLAUDE_TRACE_#{System.unique_integer([:positive])}"
+    scenario_env = "SYMP_TEST_CLAUDE_SCENARIO_#{System.unique_integer([:positive])}"
+    previous_trace = System.get_env(trace_env)
+    previous_scenario = System.get_env(scenario_env)
+
+    on_exit(fn ->
+      restore_env(trace_env, previous_trace)
+      restore_env(scenario_env, previous_scenario)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      trace_file = Path.join(test_root, "claude-runner.trace")
+      launcher = write_fake_claude_launcher!(test_root, trace_env, scenario_env)
+
+      File.mkdir_p!(workspace_root)
+      System.put_env(trace_env, trace_file)
+      System.put_env(scenario_env, "success")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        agent_backend: "claude",
+        workspace_root: workspace_root,
+        tracker_active_states: ["In Progress"],
+        hook_after_create: "printf '# test\n' > README.md",
+        claude_command: launcher,
+        max_turns: 3
+      )
+
+      issue = issue_fixture("issue-claude-in-review", "MT-CLAUDE-202", "Stop once in review")
+      parent = self()
+
+      state_fetcher = fn [_issue_id] ->
+        attempt = Process.get(:claude_agent_in_review_fetch_count, 0) + 1
+        Process.put(:claude_agent_in_review_fetch_count, attempt)
+        send(parent, {:issue_state_fetch, attempt})
+
+        {:ok, [%{issue | state: "In Review"}]}
+      end
+
+      assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
+
+      assert_receive {:worker_runtime_info, "issue-claude-in-review", %{workspace_path: workspace_path}}, 1_000
+      assert File.exists?(Path.join(workspace_path, ".symphony/claude/mcp.json"))
+
+      assert_receive {:issue_state_fetch, 1}, 1_000
+      refute_receive {:issue_state_fetch, 2}, 200
+
+      trace = File.read!(trace_file)
+      assert trace =~ "You are an agent for this repository."
+      refute trace =~ "Continuation guidance"
+      refute trace =~ "continuation turn #2"
+    after
+      Process.delete(:claude_agent_in_review_fetch_count)
+      File.rm_rf(test_root)
+    end
+  end
+
   defp issue_fixture(id, identifier, title) do
     %Issue{
       id: id,

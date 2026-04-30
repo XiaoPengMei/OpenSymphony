@@ -34,6 +34,12 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 
+completion:
+  enabled: false
+  target_state: In Review
+  marker_path: .symphony/complete
+  comment_enabled: true
+
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=medium --model gpt-5.4 app-server
   approval_policy: never

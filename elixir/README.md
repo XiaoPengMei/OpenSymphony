@@ -241,9 +241,11 @@ Notes:
 - `completion.enabled` turns on conservative completion enforcement from the global
   `symphony.yml` only. When enabled, Symphony treats `completion.marker_path` under the issue
   workspace as explicit completion proof and moves an active issue to `completion.target_state`
-  after a normal worker exit or continuation retry scan. The marker path must be relative to the
-  issue workspace. Default: disabled, target state `In Review`, marker `.symphony/complete`, and
-  audit comments enabled.
+  after a normal worker exit, continuation retry scan, or the next dispatch poll. Poll-cycle
+  sweeps reuse the already-fetched active candidate issues and check only each issue's deterministic
+  marker path, so they do not perform recursive filesystem scans or extra Linear list fetches. The
+  marker path must be relative to the issue workspace. Default: disabled, target state `In Review`,
+  marker `.symphony/complete`, and audit comments enabled.
 - OpenCode v1 is local-only in Symphony. `worker.ssh_hosts` and
   `worker.max_concurrent_agents_per_host` are rejected during config validation.
 - OpenCode stays local-only even when other backends use SSH workers. A ticket labeled `opencode`

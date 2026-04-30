@@ -122,6 +122,11 @@ agent:
   default_effort: medium
   max_concurrent_agents: 10
   max_turns: 20
+completion:
+  enabled: false
+  target_state: In Review
+  marker_path: .symphony/complete
+  comment_enabled: true
 codex:
   command: codex app-server
 claude:
@@ -233,6 +238,12 @@ Notes:
   invocation when a turn completes normally but the issue is still in an active state. In
   multi-project mode, the global value in `symphony.yml` remains the safety ceiling even if a
   repo-local workflow asks for more turns. Default: `20`.
+- `completion.enabled` turns on conservative completion enforcement from the global
+  `symphony.yml` only. When enabled, Symphony treats `completion.marker_path` under the issue
+  workspace as explicit completion proof and moves an active issue to `completion.target_state`
+  after a normal worker exit or continuation retry scan. The marker path must be relative to the
+  issue workspace. Default: disabled, target state `In Review`, marker `.symphony/complete`, and
+  audit comments enabled.
 - OpenCode v1 is local-only in Symphony. `worker.ssh_hosts` and
   `worker.max_concurrent_agents_per_host` are rejected during config validation.
 - OpenCode stays local-only even when other backends use SSH workers. A ticket labeled `opencode`

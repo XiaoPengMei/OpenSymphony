@@ -158,6 +158,26 @@ defmodule SymphonyElixir.Workspace do
     :ok
   end
 
+  @spec issue_workspace_paths(term()) :: [Path.t()]
+  def issue_workspace_paths(issue_or_identifier) do
+    issue_workspace_paths(issue_or_identifier, Config.settings!())
+  end
+
+  @spec issue_workspace_paths(term(), Schema.t()) :: [Path.t()]
+  def issue_workspace_paths(issue_or_identifier, %Schema{} = settings) do
+    issue_or_identifier
+    |> issue_context()
+    |> workspace_paths_for_issue_context(settings)
+    |> Enum.map(&canonicalize_workspace_path/1)
+  end
+
+  defp canonicalize_workspace_path(path) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} -> canonical_path
+      {:error, _reason} -> Path.expand(path)
+    end
+  end
+
   @spec preflight_repo_setup(Schema.t()) :: :ok | {:error, term()}
   def preflight_repo_setup(%Schema{} = settings) do
     worker_hosts = [nil | List.wrap(settings.worker.ssh_hosts)] |> Enum.uniq()

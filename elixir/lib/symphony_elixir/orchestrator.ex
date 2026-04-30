@@ -270,6 +270,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     with {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
+      {issues, state} = sweep_candidate_completions(issues, state)
       choose_issues(issues, state)
     else
       {:error, reason} ->
@@ -328,6 +329,12 @@ defmodule SymphonyElixir.Orchestrator do
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+  end
+
+  @doc false
+  @spec sweep_candidate_completions_for_test([Issue.t()], term()) :: {[Issue.t()], term()}
+  def sweep_candidate_completions_for_test(issues, %State{} = state) when is_list(issues) do
+    sweep_candidate_completions(issues, state)
   end
 
   @doc false
@@ -605,12 +612,64 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cheap_dispatch_candidate?(issue, state, running, claimed, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(state.completed, issue.id) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running)
   end
+
+  defp sweep_candidate_completions(issues, %State{} = state) when is_list(issues) do
+    settings = Config.settings!()
+
+    if settings.completion.enabled do
+      Enum.reduce(issues, {[], state}, fn issue, {remaining_issues, state_acc} ->
+        case sweep_candidate_completion(issue, state_acc, settings) do
+          {:completed, updated_state} -> {remaining_issues, updated_state}
+          :skip -> {[issue | remaining_issues], state_acc}
+        end
+      end)
+      |> then(fn {remaining_issues, updated_state} -> {Enum.reverse(remaining_issues), updated_state} end)
+    else
+      {issues, state}
+    end
+  end
+
+  defp sweep_candidate_completions(issues, state), do: {issues, state}
+
+  defp sweep_candidate_completion(%Issue{id: issue_id} = issue, %State{} = state, settings)
+       when is_binary(issue_id) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    cond do
+      !candidate_issue?(issue, active_states, terminal_states) ->
+        :skip
+
+      MapSet.member?(state.completed, issue_id) ->
+        {:completed, state}
+
+      MapSet.member?(state.claimed, issue_id) or Map.has_key?(state.running, issue_id) ->
+        :skip
+
+      true ->
+        issue
+        |> Workspace.issue_workspace_paths(settings)
+        |> Enum.find_value(:skip, fn workspace_path ->
+          case CompletionEnforcer.enforce(issue, workspace_path, settings) do
+            {:ok, :completed} ->
+              Logger.info("Completion sweep promoted #{issue_context(issue)} workspace=#{workspace_path}")
+              {:completed, complete_issue(state, issue_id)}
+
+            _ ->
+              false
+          end
+        end)
+    end
+  end
+
+  defp sweep_candidate_completion(_issue, _state, _settings), do: :skip
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)

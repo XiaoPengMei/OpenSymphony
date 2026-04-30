@@ -94,6 +94,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert Config.workspace_root_for_issue(agent_issue) == Path.join(default_workspace_root, "project-b")
       assert Config.project_repo_for_issue(product_issue) == product_repo
       assert Config.project_repo_for_issue(agent_issue) == agent_repo
+      assert Workspace.issue_workspace_paths(product_issue) == [expected_product_workspace]
+      assert Workspace.issue_workspace_paths(agent_issue) == [expected_agent_workspace]
 
       assert {:ok, ^expected_product_workspace} = Config.validate_workspace_path(product_workspace)
       assert {:ok, ^expected_agent_workspace} = Config.validate_workspace_path(agent_workspace)

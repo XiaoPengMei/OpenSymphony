@@ -1125,6 +1125,114 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "completion sweep promotes marked active candidate before dispatch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-sweep-#{System.unique_integer([:positive])}"
+      )
+
+    completed_issue = %Issue{
+      id: "issue-sweep-complete",
+      identifier: "MT-567",
+      title: "Sweep complete",
+      state: "In Progress"
+    }
+
+    ready_issue = %Issue{
+      id: "issue-sweep-ready",
+      identifier: "MT-568",
+      title: "Sweep ready",
+      state: "In Progress"
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      completed_workspace = Path.join(test_root, completed_issue.identifier)
+      File.mkdir_p!(Path.join(completed_workspace, ".symphony"))
+      File.write!(Path.join(completed_workspace, ".symphony/complete"), "done\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      state = %Orchestrator.State{
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 1
+      }
+
+      assert {[remaining_issue], updated_state} =
+               Orchestrator.sweep_candidate_completions_for_test([completed_issue, ready_issue], state)
+
+      assert remaining_issue.id == ready_issue.id
+      assert MapSet.member?(updated_state.completed, completed_issue.id)
+      refute Orchestrator.should_dispatch_issue_for_test(completed_issue, updated_state)
+      assert_receive {:memory_tracker_state_update, "issue-sweep-complete", "In Review"}, 1_000
+      assert_receive {:memory_tracker_comment, "issue-sweep-complete", _comment}, 1_000
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "completion sweep skips claimed and missing-marker candidates" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-sweep-skip-#{System.unique_integer([:positive])}"
+      )
+
+    claimed_issue = %Issue{
+      id: "issue-sweep-claimed",
+      identifier: "MT-569",
+      title: "Sweep claimed",
+      state: "In Progress"
+    }
+
+    missing_marker_issue = %Issue{
+      id: "issue-sweep-missing",
+      identifier: "MT-570",
+      title: "Sweep missing marker",
+      state: "In Progress"
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      claimed_workspace = Path.join(test_root, claimed_issue.identifier)
+      File.mkdir_p!(Path.join(claimed_workspace, ".symphony"))
+      File.write!(Path.join(claimed_workspace, ".symphony/complete"), "done\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([claimed_issue.id]),
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 1
+      }
+
+      assert {remaining_issues, updated_state} =
+               Orchestrator.sweep_candidate_completions_for_test([claimed_issue, missing_marker_issue], state)
+
+      assert Enum.map(remaining_issues, & &1.id) == [claimed_issue.id, missing_marker_issue.id]
+      refute MapSet.member?(updated_state.completed, claimed_issue.id)
+      refute MapSet.member?(updated_state.completed, missing_marker_issue.id)
+      refute_received {:memory_tracker_state_update, _, _}
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()

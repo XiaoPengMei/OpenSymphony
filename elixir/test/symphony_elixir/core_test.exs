@@ -950,6 +950,27 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "attempt=3"
   end
 
+  test "prompt builder returns UTF-8 binaries that can be JSON encoded" do
+    workflow_prompt = "请处理 {{ issue.identifier }}：{{ issue.title }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MT-中文-1",
+      title: "修复中文提示词编码",
+      description: "不要在 JSON 编码时失败",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-CN-1",
+      labels: ["opencode"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert is_binary(prompt)
+    assert prompt == "请处理 MT-中文-1：修复中文提示词编码"
+    assert Jason.encode!(%{content: prompt}) =~ "MT-中文-1"
+  end
+
   test "prompt builder renders issue datetime fields without crashing" do
     workflow_prompt = "Ticket {{ issue.identifier }} created={{ issue.created_at }} updated={{ issue.updated_at }}"
 

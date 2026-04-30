@@ -21,7 +21,7 @@ defmodule SymphonyElixir.PromptBuilder do
       },
       @render_opts
     )
-    |> IO.iodata_to_binary()
+    |> IO.chardata_to_string()
   end
 
   defp resolve_prompt_template(issue, opts) do

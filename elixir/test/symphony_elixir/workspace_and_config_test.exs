@@ -1068,6 +1068,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert message =~ "claude.permission_mode"
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      completion_enabled: true,
+      completion_marker_path: "../complete"
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "completion.marker_path"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
       tracker_terminal_states: %{done: true},
       poll_interval_ms: %{bad: true},

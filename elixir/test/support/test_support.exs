@@ -159,6 +159,10 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          completion_enabled: false,
+          completion_target_state: "In Review",
+          completion_marker_path: ".symphony/complete",
+          completion_comment_enabled: true,
           providers_openrouter_api_key: nil,
           accounts_enabled: false,
           accounts_store_root: "~/.symphony/accounts",
@@ -236,6 +240,10 @@ defmodule SymphonyElixir.TestSupport do
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    completion_enabled = Keyword.get(config, :completion_enabled)
+    completion_target_state = Keyword.get(config, :completion_target_state)
+    completion_marker_path = Keyword.get(config, :completion_marker_path)
+    completion_comment_enabled = Keyword.get(config, :completion_comment_enabled)
     providers_openrouter_api_key = Keyword.get(config, :providers_openrouter_api_key)
     accounts_enabled = Keyword.get(config, :accounts_enabled)
     accounts_store_root = Keyword.get(config, :accounts_store_root)
@@ -315,6 +323,7 @@ defmodule SymphonyElixir.TestSupport do
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        completion_yaml(completion_enabled, completion_target_state, completion_marker_path, completion_comment_enabled),
         providers_yaml(providers_openrouter_api_key),
         accounts_yaml(
           accounts_enabled,
@@ -710,6 +719,19 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}"
     ]
     |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
+
+  defp completion_yaml(false, "In Review", ".symphony/complete", true), do: nil
+
+  defp completion_yaml(enabled, target_state, marker_path, comment_enabled) do
+    [
+      "completion:",
+      "  enabled: #{yaml_value(enabled)}",
+      "  target_state: #{yaml_value(target_state)}",
+      "  marker_path: #{yaml_value(marker_path)}",
+      "  comment_enabled: #{yaml_value(comment_enabled)}"
+    ]
     |> Enum.join("\n")
   end
 

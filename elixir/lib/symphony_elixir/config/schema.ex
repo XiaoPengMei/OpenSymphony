@@ -172,6 +172,84 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Completion do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:target_state, :string, default: "In Review")
+      field(:marker_path, :string, default: ".symphony/complete")
+      field(:comment_enabled, :boolean, default: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      attrs = normalize_boolean_attrs(attrs, [:enabled, :comment_enabled])
+
+      schema
+      |> cast(attrs, [:enabled, :target_state, :marker_path, :comment_enabled], empty_values: [])
+      |> update_change(:target_state, &Schema.normalize_optional_string/1)
+      |> update_change(:marker_path, &Schema.normalize_optional_string/1)
+      |> validate_required([:target_state, :marker_path])
+      |> validate_change(:marker_path, fn :marker_path, value ->
+        cond do
+          Path.type(value) != :relative ->
+            [marker_path: "must be relative to the issue workspace"]
+
+          marker_path_escapes_workspace?(value) ->
+            [marker_path: "must stay inside the issue workspace"]
+
+          true ->
+            []
+        end
+      end)
+    end
+
+    defp marker_path_escapes_workspace?(value) when is_binary(value) do
+      value
+      |> Path.split()
+      |> Enum.any?(&(&1 == ".."))
+    end
+
+    defp normalize_boolean_attrs(attrs, fields) when is_map(attrs) do
+      Enum.reduce(fields, attrs, fn field, acc ->
+        acc
+        |> normalize_boolean_attr(field)
+        |> normalize_boolean_attr(Atom.to_string(field))
+      end)
+    end
+
+    defp normalize_boolean_attrs(attrs, _fields), do: attrs
+
+    defp normalize_boolean_attr(attrs, field) do
+      case Map.fetch(attrs, field) do
+        {:ok, value} -> Map.put(attrs, field, normalize_boolean_value(value))
+        :error -> attrs
+      end
+    end
+
+    defp normalize_boolean_value(value) when is_binary(value) do
+      case String.downcase(String.trim(value)) do
+        "true" -> true
+        "yes" -> true
+        "on" -> true
+        "1" -> true
+        "false" -> false
+        "no" -> false
+        "off" -> false
+        "0" -> false
+        _ -> value
+      end
+    end
+
+    defp normalize_boolean_value(value), do: value
+  end
+
   defmodule Providers do
     @moduledoc false
     use Ecto.Schema
@@ -663,6 +741,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:completion, Completion, on_replace: :update, defaults_to_struct: true)
     embeds_one(:providers, Providers, on_replace: :update, defaults_to_struct: true)
     embeds_one(:accounts, Accounts, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
@@ -790,6 +869,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
+    |> cast_embed(:completion, with: &Completion.changeset/2)
     |> cast_embed(:providers, with: &Providers.changeset/2)
     |> cast_embed(:accounts, with: &Accounts.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)

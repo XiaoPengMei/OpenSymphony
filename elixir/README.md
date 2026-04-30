@@ -209,7 +209,9 @@ Notes:
   projects do not collide under the shared root.
 - `projects[].backend` is optional. When omitted, Symphony falls back to `agent.backend`.
 - In multi-project mode, repo-local `WORKFLOW.md` files may define `hooks.*`,
-  `agent.default_effort`, `agent.max_turns`, and the prompt body only.
+  `agent.default_effort`, `agent.max_turns`, and the prompt body only. Repo-local
+  `agent.max_turns` can tighten the global runtime cap, but it cannot raise it; Symphony uses the
+  lower value when both `symphony.yml` and `WORKFLOW.md` set `agent.max_turns`.
 - `tracker.project_slug` remains the legacy single-project shorthand when you explicitly start
   Symphony with a `WORKFLOW.md` path.
 - `agent.backend` accepts `codex`, `opencode`, or `claude`. If omitted, Symphony infers the
@@ -228,7 +230,9 @@ Notes:
   Symphony can generate a workspace-local MCP server.
 - Codex uses the public `max` effort setting and maps it to Codex's `xhigh` launcher setting.
 - `agent.max_turns` caps how many back-to-back unattended turns Symphony will run in a single agent
-  invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+  invocation when a turn completes normally but the issue is still in an active state. In
+  multi-project mode, the global value in `symphony.yml` remains the safety ceiling even if a
+  repo-local workflow asks for more turns. Default: `20`.
 - OpenCode v1 is local-only in Symphony. `worker.ssh_hosts` and
   `worker.max_concurrent_agents_per_host` are rejected during config validation.
 - OpenCode stays local-only even when other backends use SSH workers. A ticket labeled `opencode`

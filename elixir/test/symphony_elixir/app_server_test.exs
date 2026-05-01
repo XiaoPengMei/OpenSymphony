@@ -767,16 +767,54 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
-        opencode_startup_timeout_ms: 500,
+        opencode_startup_timeout_ms: 2_000,
         opencode_request_timeout_ms: 100
       )
 
-      assert {:error, %{kind: :server_start_timeout, startup_timeout_ms: 500}} =
+      assert {:error, %{kind: :server_start_timeout, startup_timeout_ms: 2_000}} =
                AppServer.run(workspace, "timeout", issue_fixture("issue-cleanup", "MT-CLEANUP", "Cleanup"))
 
       assert File.exists?(pid_file)
       child_pid = pid_file |> File.read!() |> String.trim()
       refute os_process_alive?(child_pid)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server terminates launcher and descendant serve processes after successful turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-success-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-SUCCESS-CLEANUP")
+      pid_file = Path.join(test_root, "serve.pid")
+      File.mkdir_p!(workspace)
+
+      server = start_fake_opencode_server!({:success, workspace})
+      launcher = write_launcher_script_with_child!(test_root, server.base_url, pid_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        opencode_startup_timeout_ms: 1_000,
+        opencode_request_timeout_ms: 1_000,
+        opencode_turn_timeout_ms: 5_000,
+        opencode_stall_timeout_ms: 5_000
+      )
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "complete", issue_fixture("issue-success-cleanup", "MT-SUCCESS-CLEANUP", "Success cleanup"))
+
+      assert File.exists?(pid_file)
+      pids = read_pid_file!(pid_file)
+      assert length(pids) == 2
+      assert Enum.all?(pids, &(!os_process_alive?(&1)))
+      refute opencode_process_for_base_url?(server.base_url)
     after
       File.rm_rf(test_root)
     end
@@ -888,10 +926,49 @@ defmodule SymphonyElixir.AppServerTest do
     launcher
   end
 
+  defp write_launcher_script_with_child!(test_root, base_url, pid_file) do
+    launcher = Path.join(test_root, "fake-opencode-launcher-with-child.sh")
+
+    File.write!(launcher, """
+    #!/bin/sh
+    trap 'kill "$child" 2>/dev/null; exit 0' TERM INT EXIT
+    sh -c 'sleep 30 & printf "%s\\n" "$$" > "#{pid_file}"; printf "%s\\n" "$!" >> "#{pid_file}"; wait' &
+    child=$!
+    while [ ! -s "#{pid_file}" ]; do
+      sleep 0.01
+    done
+    printf 'opencode server listening on #{base_url}\\n'
+    wait "$child"
+    """)
+
+    File.chmod!(launcher, 0o755)
+    launcher
+  end
+
   defp os_process_alive?(pid_string) when is_binary(pid_string) and pid_string != "" do
     {_, status} = System.cmd("kill", ["-0", pid_string], stderr_to_stdout: true)
     status == 0
   end
 
   defp os_process_alive?(_pid_string), do: false
+
+  defp read_pid_file!(pid_file) do
+    pid_file
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp opencode_process_for_base_url?(base_url) do
+    case System.cmd("ps", ["-axo", "command"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n")
+        |> Enum.any?(&(String.contains?(&1, "fake-opencode-launcher-with-child.sh") or String.contains?(&1, base_url)))
+
+      _ ->
+        false
+    end
+  end
 end

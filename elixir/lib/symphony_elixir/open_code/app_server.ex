@@ -1020,9 +1020,10 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     metadata = port_metadata(port)
     agent_server_pid = Map.get(metadata, :agent_server_pid)
     descendants = descendant_os_pids(agent_server_pid)
+    process_group_targets = process_group_os_pids(agent_server_pid)
 
     close_port(port)
-    cleanup_process_tree(agent_server_pid, descendants)
+    cleanup_process_tree(agent_server_pid, descendants ++ process_group_targets)
     :ok
   end
 
@@ -1068,6 +1069,53 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     end
 
     :ok
+  end
+
+  defp process_group_os_pids(nil), do: []
+
+  defp process_group_os_pids(pid_string) when is_binary(pid_string) do
+    with true <- valid_os_pid?(pid_string),
+         {:ok, pgid} <- process_group_id(pid_string),
+         true <- pgid == pid_string do
+      pids_for_process_group(pgid)
+    else
+      _ -> []
+    end
+  end
+
+  defp process_group_id(pid_string) do
+    case System.cmd("ps", ["-o", "pgid=", "-p", pid_string], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.trim()
+        |> String.split(~r/\s+/, trim: true)
+        |> List.first()
+        |> case do
+          pgid when is_binary(pgid) and pgid != "" -> {:ok, pgid}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp pids_for_process_group(pgid) when is_binary(pgid) do
+    case System.cmd("ps", ["-axo", "pid=,pgid="], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.flat_map(fn line ->
+          case String.split(String.trim(line), ~r/\s+/, trim: true) do
+            [pid, ^pgid] -> [pid]
+            _ -> []
+          end
+        end)
+        |> Enum.filter(&valid_os_pid?/1)
+
+      _ ->
+        []
+    end
   end
 
   defp descendant_os_pids(nil), do: []

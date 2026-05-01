@@ -227,6 +227,11 @@ Notes:
 - `opencode.command` defaults to `opencode serve --hostname 127.0.0.1 --port 0`.
 - `opencode.agent` defaults to `build`.
 - `opencode.model` is optional and must use `provider/model` format when set.
+- `opencode.read_timeout_ms` remains the legacy default for OpenCode streaming and, unless set
+  explicitly, also seeds `opencode.startup_timeout_ms` and `opencode.request_timeout_ms`.
+  `startup_timeout_ms` controls waiting for `opencode serve` to announce its URL;
+  `request_timeout_ms` controls short control-plane requests such as health checks and session
+  creation; turn message posting uses `opencode.turn_timeout_ms`.
 - `claude.command` defaults to `claude`.
 - `claude.model` is optional.
 - `claude.permission_mode` defaults to `bypassPermissions`.
@@ -244,8 +249,10 @@ Notes:
   after a normal worker exit, continuation retry scan, or the next dispatch poll. Poll-cycle
   sweeps reuse the already-fetched active candidate issues and check only each issue's deterministic
   marker path, so they do not perform recursive filesystem scans or extra Linear list fetches. The
-  marker path must be relative to the issue workspace. Default: disabled, target state `In Review`,
-  marker `.symphony/complete`, and audit comments enabled.
+  marker path must be relative to the issue workspace. After an abnormal worker exit,
+  `completion.failure_grace_ms` gives late marker writes a short grace window before retry-state
+  marker promotion runs. Default: disabled, target state `In Review`, marker
+  `.symphony/complete`, audit comments enabled, and failure grace `5000` ms.
 - OpenCode v1 is local-only in Symphony. `worker.ssh_hosts` and
   `worker.max_concurrent_agents_per_host` are rejected during config validation.
 - OpenCode stays local-only even when other backends use SSH workers. A ticket labeled `opencode`

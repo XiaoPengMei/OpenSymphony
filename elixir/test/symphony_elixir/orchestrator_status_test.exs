@@ -1110,6 +1110,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator triggers an immediate poll cycle shortly after startup" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       poll_interval_ms: 5_000
     )
@@ -1162,6 +1163,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       poll_interval_ms: 50
     )
@@ -1211,6 +1213,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       opencode_stall_timeout_ms: 1_000
     )
@@ -1275,6 +1278,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator uses per-entry stall timeouts for mixed backends" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       agent_backend: "codex",
       codex_stall_timeout_ms: 1_000,
@@ -1283,6 +1287,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     codex_issue_id = "issue-codex-stall"
     claude_issue_id = "issue-claude-stall"
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: claude_issue_id, identifier: "MT-CLAUDE-STALL", title: "Claude active", state: "In Progress"}
+    ])
+
     orchestrator_name = Module.concat(__MODULE__, :MixedBackendStallOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 

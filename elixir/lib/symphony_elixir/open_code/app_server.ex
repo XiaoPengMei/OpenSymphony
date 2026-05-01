@@ -126,7 +126,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
     message_task =
       Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
-        post_turn_message(session, prompt)
+        post_turn_message(session, prompt, opts)
       end)
 
     started_at_ms = System.monotonic_time(:millisecond)
@@ -416,7 +416,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     end
   end
 
-  defp post_turn_message(session, prompt) do
+  defp post_turn_message(session, prompt, opts) do
     path = "/session/#{session.session_id}/message"
 
     payload =
@@ -431,6 +431,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       }
       |> maybe_put_model(session.model)
       |> maybe_put_variant(session.variant)
+      |> maybe_put_format(Keyword.get(opts, :format))
 
     message_request = Req.Request.put_option(session.request, :receive_timeout, session.turn_timeout_ms)
 
@@ -482,6 +483,9 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   end
 
   defp maybe_put_variant(payload, _variant), do: payload
+
+  defp maybe_put_format(payload, %{} = format), do: Map.put(payload, "format", format)
+  defp maybe_put_format(payload, _format), do: payload
 
   defp opencode_agent_runtime_name(agent) when is_binary(agent) do
     case agent |> String.trim() |> String.downcase() do

@@ -957,7 +957,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
     assert config.opencode.command == "opencode serve --hostname 127.0.0.1 --port 0"
-    assert config.opencode.agent == "build"
+    assert config.opencode.agent == "sisyphus"
     assert config.opencode.model == nil
     assert config.opencode.turn_timeout_ms == 3_600_000
     assert config.opencode.read_timeout_ms == 5_000
@@ -1001,7 +1001,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert runtime_settings == %{
              command: "opencode serve --hostname 127.0.0.1 --port 0",
-             agent: "build",
+             agent: "sisyphus",
              model: nil,
              variant: nil,
              turn_timeout_ms: 3_600_000,

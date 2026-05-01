@@ -405,7 +405,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
-        opencode_agent: "build",
+        opencode_agent: "sisyphus",
         opencode_model: "openai/gpt-5.4"
       )
 
@@ -429,7 +429,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert_receive {:fake_opencode_request,
                       {:message_post, "session-test",
                        %{
-                         "agent" => "build",
+                         "agent" => <<0xE2, 0x80, 0x8B>> <> "Sisyphus - Ultraworker",
                          "model" => %{"providerID" => "openai", "modelID" => "gpt-5.4"},
                          "variant" => "max",
                          "parts" => [%{"type" => "text", "text" => "Ship the change"}]
@@ -465,7 +465,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
-        opencode_agent: "build"
+        opencode_agent: "sisyphus"
       )
 
       prompt = "# Sensia OpenSymphony workflow 你正在处理 Sensia Inventory\n\n请修复 CRZ-6"
@@ -480,7 +480,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert_receive {:fake_opencode_request,
                       {:message_post, "session-test",
                        %{
-                         "agent" => "build",
+                         "agent" => <<0xE2, 0x80, 0x8B>> <> "Sisyphus - Ultraworker",
                          "parts" => [%{"type" => "text", "text" => ^prompt}]
                        }}},
                      1_000

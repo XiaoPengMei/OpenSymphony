@@ -421,7 +421,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
     payload =
       %{
-        "agent" => session.agent,
+        "agent" => opencode_agent_runtime_name(session.agent),
         "parts" => [
           %{
             "type" => "text",
@@ -482,6 +482,16 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   end
 
   defp maybe_put_variant(payload, _variant), do: payload
+
+  defp opencode_agent_runtime_name(agent) when is_binary(agent) do
+    case agent |> String.trim() |> String.downcase() do
+      "sisyphus" -> <<0xE2, 0x80, 0x8B>> <> "Sisyphus - Ultraworker"
+      "sisyphus - ultraworker" -> <<0xE2, 0x80, 0x8B>> <> "Sisyphus - Ultraworker"
+      _ -> agent
+    end
+  end
+
+  defp opencode_agent_runtime_name(agent), do: agent
 
   defp await_turn_result(
          session,
@@ -1044,12 +1054,9 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     terminate_os_processes([pid_string], "TERM")
     Process.sleep(@process_cleanup_wait_ms)
 
-    kill_targets =
-      (initial_targets ++ descendant_os_pids(pid_string) ++ [pid_string])
-      |> Enum.uniq()
-      |> Enum.filter(&os_process_alive?/1)
-
-    terminate_os_processes(kill_targets, "KILL")
+    (initial_targets ++ descendant_os_pids(pid_string) ++ [pid_string])
+    |> Enum.uniq()
+    |> cleanup_remaining_os_processes()
 
     :ok
   rescue
@@ -1067,6 +1074,22 @@ defmodule SymphonyElixir.OpenCode.AppServer do
         {_output, _status} = System.cmd("kill", ["-#{signal}", pid_string], stderr_to_stdout: true)
       end)
     end
+
+    :ok
+  end
+
+  defp cleanup_remaining_os_processes(targets) when is_list(targets) do
+    targets
+    |> Enum.filter(&os_process_alive?/1)
+    |> terminate_os_processes("KILL")
+
+    Process.sleep(@process_cleanup_wait_ms)
+
+    targets
+    |> Enum.flat_map(fn pid -> [pid | process_group_os_pids(pid)] end)
+    |> Enum.uniq()
+    |> Enum.filter(&os_process_alive?/1)
+    |> terminate_os_processes("KILL")
 
     :ok
   end

@@ -424,7 +424,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "opencode serve --hostname 127.0.0.1 --port 0")
-      field(:agent, :string, default: "build")
+      field(:agent, :string, default: "sisyphus")
       field(:model, :string)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)

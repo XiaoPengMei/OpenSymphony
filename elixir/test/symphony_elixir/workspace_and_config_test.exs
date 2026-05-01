@@ -701,6 +701,75 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(sorted, & &1.identifier) == ["MT-200", "MT-201", "MT-199"]
   end
 
+  test "orchestrator groups dispatch planning by project" do
+    project_a_first = %Issue{id: "a-1", identifier: "A-1", title: "A1", state: "Todo", project_id: "project-a"}
+    project_a_second = %Issue{id: "a-2", identifier: "A-2", title: "A2", state: "Todo", project_id: "project-a"}
+    project_b = %Issue{id: "b-1", identifier: "B-1", title: "B1", state: "Todo", project_id: "project-b"}
+
+    assert [
+             {"id:project-a", [%Issue{id: "a-1"}, %Issue{id: "a-2"}]},
+             {"id:project-b", [%Issue{id: "b-1"}]}
+           ] = Orchestrator.project_issue_groups_for_test([project_a_first, project_a_second, project_b])
+  end
+
+  test "same-project multi-issue groups use planner order" do
+    issues = [
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "Todo", project_id: "project-a"}
+    ]
+
+    assert [%Issue{id: "issue-b"}, %Issue{id: "issue-a"}] =
+             Orchestrator.planned_project_issue_order_for_test("id:project-a", issues, __MODULE__.ReversePlanner)
+  end
+
+  test "single-issue project groups bypass planner" do
+    issues = [%Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"}]
+
+    assert [%Issue{id: "issue-a"}] =
+             Orchestrator.planned_project_issue_order_for_test("id:project-a", issues, __MODULE__.FailingPlanner)
+  end
+
+  test "planner failures retry three times before falling back to priority order" do
+    test_pid = self()
+    Application.put_env(:symphony_elixir, :planner_test_recipient, test_pid)
+
+    issues = [
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "Todo", project_id: "project-a"}
+    ]
+
+    assert [%Issue{id: "issue-a"}, %Issue{id: "issue-b"}] =
+             Orchestrator.planned_project_issue_order_for_test("id:project-a", issues, __MODULE__.CountingFailingPlanner)
+
+    assert_received {:planner_attempt, 1}
+    assert_received {:planner_attempt, 2}
+    assert_received {:planner_attempt, 3}
+    refute_received {:planner_attempt, 4}
+  end
+
+  defmodule ReversePlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [String.t()]}
+    def plan_project_issues(_project_key, issues, _opts) do
+      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse()}
+    end
+  end
+
+  defmodule FailingPlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:error, :should_not_be_called}
+    def plan_project_issues(_project_key, _issues, _opts), do: {:error, :should_not_be_called}
+  end
+
+  defmodule CountingFailingPlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:error, :planned_failure}
+    def plan_project_issues(_project_key, _issues, opts) do
+      if pid = Application.get_env(:symphony_elixir, :planner_test_recipient) do
+        send(pid, {:planner_attempt, Keyword.fetch!(opts, :attempt)})
+      end
+
+      {:error, :planned_failure}
+    end
+  end
+
   test "todo issue with non-terminal blocker is not dispatch-eligible" do
     state = %Orchestrator.State{
       max_concurrent_agents: 3,

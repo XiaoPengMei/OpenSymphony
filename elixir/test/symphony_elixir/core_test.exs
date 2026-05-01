@@ -1846,6 +1846,77 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "orchestrator executes same-project issues in planner order" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-planner-dispatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1,
+        prompt: "Issue {{ issue.identifier }}: {{ issue.title }}"
+      )
+
+      Application.put_env(:symphony_elixir, :project_issue_planner, __MODULE__.ReversePlanner)
+
+      issue_a = %Issue{id: "issue-a", identifier: "A-1", title: "First issue", state: "Todo", project_id: "project-a"}
+      issue_b = %Issue{id: "issue-b", identifier: "B-1", title: "Second issue", state: "Todo", project_id: "project-a"}
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue_a, issue_b])
+
+      orchestrator_name = Module.concat(__MODULE__, :PlannerDispatchOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+
+      assert :ok =
+               __MODULE__.FakeOpenCodeState.wait_until(server.state, fn current ->
+                 length(current.message_posts) == 1
+               end)
+
+      [first_post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
+      assert message_text(first_post) =~ "Second issue"
+      refute message_text(first_post) =~ "First issue"
+
+      assert :ok = wait_until_orchestrator(pid, &(!Map.has_key?(&1.running, "issue-b")))
+
+      state_after_first = :sys.get_state(pid)
+      refute Map.has_key?(state_after_first.running, "issue-b")
+      assert MapSet.member?(state_after_first.claimed, "issue-b")
+
+      send(pid, :tick)
+
+      assert :ok =
+               __MODULE__.FakeOpenCodeState.wait_until(server.state, fn current ->
+                 length(current.message_posts) == 2
+               end)
+
+      [_first_post, second_post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
+      assert message_text(second_post) =~ "First issue"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner forwards timestamped agent updates to recipient" do
     test_root =
       Path.join(
@@ -2134,6 +2205,13 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  defmodule ReversePlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [String.t()]}
+    def plan_project_issues(_project_key, issues, _opts) do
+      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse()}
+    end
+  end
+
   defmodule FakeOpenCodePlug do
     import Plug.Conn
 
@@ -2241,6 +2319,24 @@ defmodule SymphonyElixir.CoreTest do
 
     File.chmod!(launcher, 0o755)
     launcher
+  end
+
+  defp wait_until_orchestrator(pid, predicate, timeout_ms \\ 1_000) when is_function(predicate, 1) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until_orchestrator(pid, predicate, deadline_ms)
+  end
+
+  defp do_wait_until_orchestrator(pid, predicate, deadline_ms) do
+    if predicate.(:sys.get_state(pid)) do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline_ms do
+        {:error, :timeout}
+      else
+        Process.sleep(10)
+        do_wait_until_orchestrator(pid, predicate, deadline_ms)
+      end
+    end
   end
 
   defp message_text(%{body: %{"parts" => [part | _]}}) when is_map(part) do

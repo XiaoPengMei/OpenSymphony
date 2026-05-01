@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{Accounts, AgentRoute, AgentRunner, CompletionEnforcer, Config, IssueConfig, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{Accounts, AgentRoute, AgentRunner, CompletionEnforcer, Config, IssueConfig, ProjectIssuePlanner, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -26,6 +26,7 @@ defmodule SymphonyElixir.Orchestrator do
     total_tokens: 0,
     seconds_running: 0
   }
+  @planner_max_attempts 3
 
   defmodule State do
     @moduledoc """
@@ -344,6 +345,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec project_issue_groups_for_test([Issue.t()]) :: [{String.t(), [Issue.t()]}]
+  def project_issue_groups_for_test(issues) when is_list(issues) do
+    project_issue_groups(issues)
+  end
+
+  @doc false
+  @spec planned_project_issue_order_for_test(String.t(), [Issue.t()], module()) :: [Issue.t()]
+  def planned_project_issue_order_for_test(project_key, issues, planner_module) do
+    planned_project_issue_order(project_key, issues, planner_module)
+  end
+
+  @doc false
   @spec select_worker_host_for_test(term(), String.t() | nil, String.t() | nil) ::
           String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host, backend \\ nil) do
@@ -550,24 +563,114 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    planner_module = project_issue_planner_module()
 
     issues
     |> sort_issues_for_dispatch()
-    |> Enum.reduce_while(state, fn issue, state_acc ->
-      if available_slots(state_acc) <= 0 do
-        {:halt, state_acc}
-      else
-        state_acc =
-          if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-            dispatch_issue(state_acc, issue)
-          else
-            state_acc
-          end
+    |> project_issue_groups()
+    |> Enum.reduce_while(state, fn {project_key, project_issues}, state_acc ->
+      ordered_issues = planned_project_issue_order(project_key, project_issues, planner_module)
 
-        {:cont, state_acc}
+      state_acc = dispatch_planned_issues(ordered_issues, state_acc, active_states, terminal_states)
+
+      if available_slots(state_acc) <= 0, do: {:halt, state_acc}, else: {:cont, state_acc}
+    end)
+  end
+
+  defp dispatch_planned_issues(issues, state, active_states, terminal_states) when is_list(issues) do
+    Enum.reduce_while(issues, state, fn issue, state_acc ->
+      cond do
+        available_slots(state_acc) <= 0 ->
+          {:halt, state_acc}
+
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+          {:cont, dispatch_issue(state_acc, issue)}
+
+        true ->
+          {:cont, state_acc}
       end
     end)
   end
+
+  defp project_issue_groups(issues) when is_list(issues) do
+    issues
+    |> Enum.reduce({[], %{}}, fn issue, {order, groups} ->
+      project_key = issue_project_group_key(issue)
+      order = if Map.has_key?(groups, project_key), do: order, else: order ++ [project_key]
+      groups = Map.update(groups, project_key, [issue], &(&1 ++ [issue]))
+      {order, groups}
+    end)
+    |> then(fn {order, groups} -> Enum.map(order, &{&1, Map.fetch!(groups, &1)}) end)
+  end
+
+  defp planned_project_issue_order(_project_key, [issue], _planner_module), do: [issue]
+
+  defp planned_project_issue_order(project_key, issues, planner_module) when is_list(issues) do
+    case plan_project_issue_ids(project_key, issues, planner_module, 1) do
+      {:ok, ordered_issue_ids} -> order_issues_by_ids(issues, ordered_issue_ids)
+      {:error, _reason} -> issues
+    end
+  end
+
+  defp plan_project_issue_ids(project_key, issues, planner_module, attempt) when attempt <= @planner_max_attempts do
+    case planner_module.plan_project_issues(project_key, issues, attempt: attempt, max_attempts: @planner_max_attempts) do
+      {:ok, issue_ids} ->
+        case validate_planned_issue_ids(issues, issue_ids) do
+          {:ok, validated_issue_ids} ->
+            {:ok, validated_issue_ids}
+
+          {:error, reason} when attempt < @planner_max_attempts ->
+            Logger.warning("Project issue planner returned invalid order project=#{project_key} attempt=#{attempt}/#{@planner_max_attempts} reason=#{inspect(reason)}")
+            plan_project_issue_ids(project_key, issues, planner_module, attempt + 1)
+
+          {:error, reason} ->
+            Logger.warning("Project issue planner exhausted project=#{project_key} attempts=#{@planner_max_attempts} reason=#{inspect(reason)}; falling back to priority dispatch order")
+            {:error, reason}
+        end
+
+      {:error, reason} when attempt < @planner_max_attempts ->
+        Logger.warning("Project issue planner failed project=#{project_key} attempt=#{attempt}/#{@planner_max_attempts} reason=#{inspect(reason)}")
+        plan_project_issue_ids(project_key, issues, planner_module, attempt + 1)
+
+      {:error, reason} ->
+        Logger.warning("Project issue planner exhausted project=#{project_key} attempts=#{@planner_max_attempts} reason=#{inspect(reason)}; falling back to priority dispatch order")
+        {:error, reason}
+    end
+  end
+
+  defp validate_planned_issue_ids(issues, issue_ids) when is_list(issue_ids) do
+    known_ids = MapSet.new(issues, & &1.id)
+    duplicate_ids = issue_ids -- Enum.uniq(issue_ids)
+    unknown_ids = Enum.reject(issue_ids, &MapSet.member?(known_ids, &1))
+
+    cond do
+      duplicate_ids != [] -> {:error, {:duplicate_planned_issue_ids, Enum.uniq(duplicate_ids)}}
+      unknown_ids != [] -> {:error, {:unknown_planned_issue_ids, unknown_ids}}
+      true -> {:ok, issue_ids}
+    end
+  end
+
+  defp validate_planned_issue_ids(_issues, issue_ids), do: {:error, {:invalid_planned_issue_ids, issue_ids}}
+
+  defp order_issues_by_ids(issues, issue_ids) do
+    issue_by_id = Map.new(issues, &{&1.id, &1})
+
+    issue_ids
+    |> Enum.flat_map(fn issue_id ->
+      case Map.fetch(issue_by_id, issue_id) do
+        {:ok, issue} -> [issue]
+        :error -> []
+      end
+    end)
+  end
+
+  defp project_issue_planner_module do
+    Application.get_env(:symphony_elixir, :project_issue_planner, ProjectIssuePlanner)
+  end
+
+  defp issue_project_group_key(%Issue{project_id: project_id}) when is_binary(project_id) and project_id != "", do: "id:" <> project_id
+  defp issue_project_group_key(%Issue{project_slug: project_slug}) when is_binary(project_slug) and project_slug != "", do: "slug:" <> project_slug
+  defp issue_project_group_key(%Issue{} = issue), do: "unassigned:" <> (issue.id || issue.identifier || "unknown")
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
     Enum.sort_by(issues, fn

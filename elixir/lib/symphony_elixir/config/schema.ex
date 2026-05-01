@@ -185,6 +185,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:target_state, :string, default: "In Review")
       field(:marker_path, :string, default: ".symphony/complete")
       field(:comment_enabled, :boolean, default: true)
+      field(:failure_grace_ms, :integer, default: 5_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -192,10 +193,11 @@ defmodule SymphonyElixir.Config.Schema do
       attrs = normalize_boolean_attrs(attrs, [:enabled, :comment_enabled])
 
       schema
-      |> cast(attrs, [:enabled, :target_state, :marker_path, :comment_enabled], empty_values: [])
+      |> cast(attrs, [:enabled, :target_state, :marker_path, :comment_enabled, :failure_grace_ms], empty_values: [])
       |> update_change(:target_state, &Schema.normalize_optional_string/1)
       |> update_change(:marker_path, &Schema.normalize_optional_string/1)
       |> validate_required([:target_state, :marker_path])
+      |> validate_number(:failure_grace_ms, greater_than_or_equal_to: 0)
       |> validate_change(:marker_path, fn :marker_path, value ->
         cond do
           Path.type(value) != :relative ->
@@ -426,6 +428,8 @@ defmodule SymphonyElixir.Config.Schema do
       field(:model, :string)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
+      field(:startup_timeout_ms, :integer)
+      field(:request_timeout_ms, :integer)
       field(:stall_timeout_ms, :integer, default: 300_000)
     end
 
@@ -440,6 +444,8 @@ defmodule SymphonyElixir.Config.Schema do
           :model,
           :turn_timeout_ms,
           :read_timeout_ms,
+          :startup_timeout_ms,
+          :request_timeout_ms,
           :stall_timeout_ms
         ],
         empty_values: []
@@ -447,6 +453,8 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_required([:command, :agent])
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:startup_timeout_ms, greater_than: 0)
+      |> validate_number(:request_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_change(:model, fn :model, value ->
         cond do
@@ -932,7 +940,9 @@ defmodule SymphonyElixir.Config.Schema do
 
     opencode = %{
       settings.opencode
-      | model: normalize_optional_string(settings.opencode.model)
+      | model: normalize_optional_string(settings.opencode.model),
+        startup_timeout_ms: settings.opencode.startup_timeout_ms || settings.opencode.read_timeout_ms,
+        request_timeout_ms: settings.opencode.request_timeout_ms || settings.opencode.read_timeout_ms
     }
 
     claude = %{

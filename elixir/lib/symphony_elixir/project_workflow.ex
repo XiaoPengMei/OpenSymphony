@@ -49,6 +49,8 @@ defmodule SymphonyElixir.ProjectWorkflow do
                            "model",
                            "turn_timeout_ms",
                            "read_timeout_ms",
+                           "startup_timeout_ms",
+                           "request_timeout_ms",
                            "stall_timeout_ms"
                          ])
 
@@ -220,11 +222,19 @@ defmodule SymphonyElixir.ProjectWorkflow do
         model: nil,
         turn_timeout_ms: nil,
         read_timeout_ms: nil,
+        startup_timeout_ms: nil,
+        request_timeout_ms: nil,
         stall_timeout_ms: nil
       }
-      |> cast(attrs, [:command, :agent, :model, :turn_timeout_ms, :read_timeout_ms, :stall_timeout_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [:command, :agent, :model, :turn_timeout_ms, :read_timeout_ms, :startup_timeout_ms, :request_timeout_ms, :stall_timeout_ms],
+        empty_values: []
+      )
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:startup_timeout_ms, greater_than: 0)
+      |> validate_number(:request_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_change(:model, fn :model, value ->
         cond do

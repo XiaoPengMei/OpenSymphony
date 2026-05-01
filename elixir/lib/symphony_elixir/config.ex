@@ -34,6 +34,8 @@ defmodule SymphonyElixir.Config do
           variant: String.t() | nil,
           turn_timeout_ms: pos_integer(),
           read_timeout_ms: pos_integer(),
+          startup_timeout_ms: pos_integer(),
+          request_timeout_ms: pos_integer(),
           stall_timeout_ms: non_neg_integer()
         }
 
@@ -674,6 +676,8 @@ defmodule SymphonyElixir.Config do
          variant: Schema.normalize_optional_effort(Keyword.get(opts, :variant)),
          turn_timeout_ms: settings.opencode.turn_timeout_ms,
          read_timeout_ms: settings.opencode.read_timeout_ms,
+         startup_timeout_ms: settings.opencode.startup_timeout_ms,
+         request_timeout_ms: settings.opencode.request_timeout_ms,
          stall_timeout_ms: settings.opencode.stall_timeout_ms
        }}
     end

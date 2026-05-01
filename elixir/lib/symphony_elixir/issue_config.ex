@@ -115,8 +115,11 @@ defmodule SymphonyElixir.IssueConfig do
             :model,
             :turn_timeout_ms,
             :read_timeout_ms,
+            :startup_timeout_ms,
+            :request_timeout_ms,
             :stall_timeout_ms
-          ]),
+          ])
+          |> inherit_legacy_opencode_read_timeout(workflow.opencode),
         claude:
           merge_struct_fields(settings.claude, workflow.claude, [
             :command,
@@ -137,6 +140,13 @@ defmodule SymphonyElixir.IssueConfig do
       end
     end)
   end
+
+  defp inherit_legacy_opencode_read_timeout(opencode, %{read_timeout_ms: read_timeout_ms, startup_timeout_ms: nil, request_timeout_ms: nil})
+       when is_integer(read_timeout_ms) do
+    %{opencode | startup_timeout_ms: read_timeout_ms, request_timeout_ms: read_timeout_ms}
+  end
+
+  defp inherit_legacy_opencode_read_timeout(opencode, _workflow_opencode), do: opencode
 
   defp put_bounded_max_turns(agent, global_max_turns, workflow_max_turns)
        when is_integer(global_max_turns) and is_integer(workflow_max_turns) do

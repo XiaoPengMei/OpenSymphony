@@ -163,6 +163,7 @@ defmodule SymphonyElixir.TestSupport do
           completion_target_state: "In Review",
           completion_marker_path: ".symphony/complete",
           completion_comment_enabled: true,
+          completion_failure_grace_ms: 5_000,
           providers_openrouter_api_key: nil,
           accounts_enabled: false,
           accounts_store_root: "~/.symphony/accounts",
@@ -190,6 +191,8 @@ defmodule SymphonyElixir.TestSupport do
           opencode_model: nil,
           opencode_turn_timeout_ms: 3_600_000,
           opencode_read_timeout_ms: 5_000,
+          opencode_startup_timeout_ms: nil,
+          opencode_request_timeout_ms: nil,
           opencode_stall_timeout_ms: 300_000,
           claude_command: "claude",
           claude_model: nil,
@@ -244,6 +247,7 @@ defmodule SymphonyElixir.TestSupport do
     completion_target_state = Keyword.get(config, :completion_target_state)
     completion_marker_path = Keyword.get(config, :completion_marker_path)
     completion_comment_enabled = Keyword.get(config, :completion_comment_enabled)
+    completion_failure_grace_ms = Keyword.get(config, :completion_failure_grace_ms)
     providers_openrouter_api_key = Keyword.get(config, :providers_openrouter_api_key)
     accounts_enabled = Keyword.get(config, :accounts_enabled)
     accounts_store_root = Keyword.get(config, :accounts_store_root)
@@ -271,6 +275,8 @@ defmodule SymphonyElixir.TestSupport do
     opencode_model = Keyword.get(config, :opencode_model)
     opencode_turn_timeout_ms = Keyword.get(config, :opencode_turn_timeout_ms)
     opencode_read_timeout_ms = Keyword.get(config, :opencode_read_timeout_ms)
+    opencode_startup_timeout_ms = Keyword.get(config, :opencode_startup_timeout_ms)
+    opencode_request_timeout_ms = Keyword.get(config, :opencode_request_timeout_ms)
     opencode_stall_timeout_ms = Keyword.get(config, :opencode_stall_timeout_ms)
     claude_command = Keyword.get(config, :claude_command)
     claude_model = Keyword.get(config, :claude_model)
@@ -323,7 +329,13 @@ defmodule SymphonyElixir.TestSupport do
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
-        completion_yaml(completion_enabled, completion_target_state, completion_marker_path, completion_comment_enabled),
+        completion_yaml(
+          completion_enabled,
+          completion_target_state,
+          completion_marker_path,
+          completion_comment_enabled,
+          completion_failure_grace_ms
+        ),
         providers_yaml(providers_openrouter_api_key),
         accounts_yaml(
           accounts_enabled,
@@ -356,6 +368,8 @@ defmodule SymphonyElixir.TestSupport do
         "  model: #{yaml_value(opencode_model)}",
         "  turn_timeout_ms: #{yaml_value(opencode_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(opencode_read_timeout_ms)}",
+        !is_nil(opencode_startup_timeout_ms) && "  startup_timeout_ms: #{yaml_value(opencode_startup_timeout_ms)}",
+        !is_nil(opencode_request_timeout_ms) && "  request_timeout_ms: #{yaml_value(opencode_request_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(opencode_stall_timeout_ms)}",
         "claude:",
         "  command: #{yaml_value(claude_command)}",
@@ -388,7 +402,7 @@ defmodule SymphonyElixir.TestSupport do
         "---",
         prompt
       ]
-      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.reject(&(&1 in [nil, false, ""]))
 
     Enum.join(sections, "\n") <> "\n"
   end
@@ -404,6 +418,9 @@ defmodule SymphonyElixir.TestSupport do
           hook_after_run: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
+          opencode_read_timeout_ms: nil,
+          opencode_startup_timeout_ms: nil,
+          opencode_request_timeout_ms: nil,
           prompt: @workflow_prompt
         ],
         overrides
@@ -416,6 +433,9 @@ defmodule SymphonyElixir.TestSupport do
     hook_after_run = Keyword.get(config, :hook_after_run)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
+    opencode_read_timeout_ms = Keyword.get(config, :opencode_read_timeout_ms)
+    opencode_startup_timeout_ms = Keyword.get(config, :opencode_startup_timeout_ms)
+    opencode_request_timeout_ms = Keyword.get(config, :opencode_request_timeout_ms)
     prompt = Keyword.get(config, :prompt)
 
     sections =
@@ -423,10 +443,11 @@ defmodule SymphonyElixir.TestSupport do
         "---",
         project_hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         project_agent_yaml(default_effort, max_turns),
+        project_opencode_yaml(opencode_read_timeout_ms, opencode_startup_timeout_ms, opencode_request_timeout_ms),
         "---",
         prompt
       ]
-      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.reject(&(&1 in [nil, false, ""]))
 
     Enum.join(sections, "\n") <> "\n"
   end
@@ -444,6 +465,11 @@ defmodule SymphonyElixir.TestSupport do
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
+          completion_enabled: false,
+          completion_target_state: "In Review",
+          completion_marker_path: ".symphony/complete",
+          completion_comment_enabled: true,
+          completion_failure_grace_ms: 5_000,
           providers_openrouter_api_key: nil,
           accounts_enabled: false,
           accounts_store_root: "~/.symphony/accounts",
@@ -471,6 +497,8 @@ defmodule SymphonyElixir.TestSupport do
           opencode_model: nil,
           opencode_turn_timeout_ms: 3_600_000,
           opencode_read_timeout_ms: 5_000,
+          opencode_startup_timeout_ms: nil,
+          opencode_request_timeout_ms: nil,
           opencode_stall_timeout_ms: 300_000,
           claude_command: "claude",
           claude_model: nil,
@@ -518,6 +546,11 @@ defmodule SymphonyElixir.TestSupport do
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    completion_enabled = Keyword.get(config, :completion_enabled)
+    completion_target_state = Keyword.get(config, :completion_target_state)
+    completion_marker_path = Keyword.get(config, :completion_marker_path)
+    completion_comment_enabled = Keyword.get(config, :completion_comment_enabled)
+    completion_failure_grace_ms = Keyword.get(config, :completion_failure_grace_ms)
     providers_openrouter_api_key = Keyword.get(config, :providers_openrouter_api_key)
     accounts_enabled = Keyword.get(config, :accounts_enabled)
     accounts_store_root = Keyword.get(config, :accounts_store_root)
@@ -545,6 +578,8 @@ defmodule SymphonyElixir.TestSupport do
     opencode_model = Keyword.get(config, :opencode_model)
     opencode_turn_timeout_ms = Keyword.get(config, :opencode_turn_timeout_ms)
     opencode_read_timeout_ms = Keyword.get(config, :opencode_read_timeout_ms)
+    opencode_startup_timeout_ms = Keyword.get(config, :opencode_startup_timeout_ms)
+    opencode_request_timeout_ms = Keyword.get(config, :opencode_request_timeout_ms)
     opencode_stall_timeout_ms = Keyword.get(config, :opencode_stall_timeout_ms)
     claude_command = Keyword.get(config, :claude_command)
     claude_model = Keyword.get(config, :claude_model)
@@ -603,6 +638,13 @@ defmodule SymphonyElixir.TestSupport do
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        completion_yaml(
+          completion_enabled,
+          completion_target_state,
+          completion_marker_path,
+          completion_comment_enabled,
+          completion_failure_grace_ms
+        ),
         providers_yaml(providers_openrouter_api_key),
         accounts_yaml(
           accounts_enabled,
@@ -635,6 +677,8 @@ defmodule SymphonyElixir.TestSupport do
         "  model: #{yaml_value(opencode_model)}",
         "  turn_timeout_ms: #{yaml_value(opencode_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(opencode_read_timeout_ms)}",
+        !is_nil(opencode_startup_timeout_ms) && "  startup_timeout_ms: #{yaml_value(opencode_startup_timeout_ms)}",
+        !is_nil(opencode_request_timeout_ms) && "  request_timeout_ms: #{yaml_value(opencode_request_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(opencode_stall_timeout_ms)}",
         "claude:",
         "  command: #{yaml_value(claude_command)}",
@@ -665,7 +709,7 @@ defmodule SymphonyElixir.TestSupport do
         instance_yaml(instance_name),
         "projects: #{yaml_value(projects)}"
       ]
-      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.reject(&(&1 in [nil, false, ""]))
 
     Enum.join(sections, "\n") <> "\n"
   end
@@ -722,15 +766,16 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp completion_yaml(false, "In Review", ".symphony/complete", true), do: nil
+  defp completion_yaml(false, "In Review", ".symphony/complete", true, 5_000), do: nil
 
-  defp completion_yaml(enabled, target_state, marker_path, comment_enabled) do
+  defp completion_yaml(enabled, target_state, marker_path, comment_enabled, failure_grace_ms) do
     [
       "completion:",
       "  enabled: #{yaml_value(enabled)}",
       "  target_state: #{yaml_value(target_state)}",
       "  marker_path: #{yaml_value(marker_path)}",
-      "  comment_enabled: #{yaml_value(comment_enabled)}"
+      "  comment_enabled: #{yaml_value(comment_enabled)}",
+      "  failure_grace_ms: #{yaml_value(failure_grace_ms)}"
     ]
     |> Enum.join("\n")
   end
@@ -910,6 +955,19 @@ defmodule SymphonyElixir.TestSupport do
       "agent:",
       !is_nil(default_effort) && "  default_effort: #{yaml_value(default_effort)}",
       !is_nil(max_turns) && "  max_turns: #{yaml_value(max_turns)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
+
+  defp project_opencode_yaml(nil, nil, nil), do: nil
+
+  defp project_opencode_yaml(read_timeout_ms, startup_timeout_ms, request_timeout_ms) do
+    [
+      "opencode:",
+      !is_nil(read_timeout_ms) && "  read_timeout_ms: #{yaml_value(read_timeout_ms)}",
+      !is_nil(startup_timeout_ms) && "  startup_timeout_ms: #{yaml_value(startup_timeout_ms)}",
+      !is_nil(request_timeout_ms) && "  request_timeout_ms: #{yaml_value(request_timeout_ms)}"
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")

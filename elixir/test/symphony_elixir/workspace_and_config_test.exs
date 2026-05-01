@@ -961,6 +961,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.opencode.model == nil
     assert config.opencode.turn_timeout_ms == 3_600_000
     assert config.opencode.read_timeout_ms == 5_000
+    assert config.opencode.startup_timeout_ms == 5_000
+    assert config.opencode.request_timeout_ms == 5_000
     assert config.opencode.stall_timeout_ms == 300_000
     assert config.claude.command == "claude"
     assert config.claude.model == nil
@@ -1004,6 +1006,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              variant: nil,
              turn_timeout_ms: 3_600_000,
              read_timeout_ms: 5_000,
+             startup_timeout_ms: 5_000,
+             request_timeout_ms: 5_000,
              stall_timeout_ms: 300_000
            }
 
@@ -1056,6 +1060,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), opencode_read_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "opencode.read_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), opencode_startup_timeout_ms: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "opencode.startup_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), opencode_request_timeout_ms: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "opencode.request_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), opencode_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -1274,6 +1286,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert settings.agent.backend == "codex"
     assert settings.codex.command == "codex app-server --model gpt-5.3-codex"
+  end
+
+  test "schema parse keeps OpenCode read timeout as legacy alias unless split timeouts are set" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{kind: "memory"},
+               opencode: %{read_timeout_ms: 12_345}
+             })
+
+    assert settings.opencode.read_timeout_ms == 12_345
+    assert settings.opencode.startup_timeout_ms == 12_345
+    assert settings.opencode.request_timeout_ms == 12_345
+
+    assert {:ok, settings} =
+             Schema.parse(%{
+               tracker: %{kind: "memory"},
+               opencode: %{
+                 read_timeout_ms: 12_345,
+                 startup_timeout_ms: 2_000,
+                 request_timeout_ms: 30_000
+               }
+             })
+
+    assert settings.opencode.read_timeout_ms == 12_345
+    assert settings.opencode.startup_timeout_ms == 2_000
+    assert settings.opencode.request_timeout_ms == 30_000
   end
 
   test "schema parse accepts claude config and infers claude backend" do
@@ -1897,6 +1935,50 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, issue_config} = SymphonyElixir.IssueConfig.resolve(issue)
       assert issue_config.settings.agent.max_turns == 1
       assert PromptBuilder.build_prompt(issue, issue_config: issue_config) == "Project prompt for AP-43"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "issue config treats project OpenCode read timeout as split timeout alias" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-issue-config-opencode-timeouts-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      repo_root = Path.join(test_root, "project-b")
+      config_path = Path.join(test_root, "symphony.yml")
+
+      init_repo!(repo_root, "project b\n")
+
+      write_project_workflow_repo_file!(repo_root, "WORKFLOW.md",
+        opencode_read_timeout_ms: 12_345,
+        prompt: "Project prompt for {{ issue.identifier }}"
+      )
+
+      write_symphony_config_file!(config_path,
+        opencode_read_timeout_ms: 5_000,
+        opencode_startup_timeout_ms: 2_000,
+        opencode_request_timeout_ms: 30_000,
+        projects: [
+          %{
+            linear_project: "project-b",
+            repo: repo_root,
+            workflow: "./WORKFLOW.md"
+          }
+        ]
+      )
+
+      SymphonyConfig.set_config_file_path(config_path)
+
+      issue = %Issue{identifier: "AP-44", title: "Project OpenCode timeouts", project_slug: "project-b"}
+
+      assert {:ok, issue_config} = SymphonyElixir.IssueConfig.resolve(issue)
+      assert issue_config.settings.opencode.read_timeout_ms == 12_345
+      assert issue_config.settings.opencode.startup_timeout_ms == 12_345
+      assert issue_config.settings.opencode.request_timeout_ms == 12_345
     after
       File.rm_rf(test_root)
     end

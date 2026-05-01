@@ -259,6 +259,18 @@ defmodule SymphonyElixir.AppServerTest do
           end)
 
           json(conn, 200, %{"info" => %{"id" => "assistant-message-6", "sessionID" => session_id}})
+
+        :quiet_event_stream ->
+          Process.sleep(250)
+          broadcast_success_events(state, session_id)
+
+          json(conn, 200, %{
+            "info" => %{
+              "id" => "assistant-message-7",
+              "sessionID" => session_id,
+              "tokens" => %{"input" => 3, "output" => 2, "reasoning" => 1}
+            }
+          })
       end
     end
 
@@ -655,7 +667,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server returns actionable timeout details when posting a turn message times out" do
+  test "app server lets a turn message outlive the short request timeout" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -674,21 +686,13 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
-        opencode_read_timeout_ms: 1_000,
+        opencode_startup_timeout_ms: 1_000,
+        opencode_request_timeout_ms: 1_000,
+        opencode_turn_timeout_ms: 5_000,
         opencode_stall_timeout_ms: 5_000
       )
 
-      assert {:error,
-              %{
-                kind: :message_post_timeout,
-                phase: :post_turn_message,
-                session_id: "session-test",
-                read_timeout_ms: 1_000,
-                method: "POST",
-                path: "/session/session-test/message",
-                message: message,
-                hint: hint
-              }} =
+      assert {:ok, result} =
                AppServer.run(
                  workspace,
                  "Wait too long",
@@ -696,15 +700,83 @@ defmodule SymphonyElixir.AppServerTest do
                  on_message: &send(parent, {:agent_message, &1})
                )
 
-      assert message =~ "OpenCode did not respond to POST /session/session-test/message"
-      assert hint =~ "Increase opencode.read_timeout_ms"
+      assert result.session_id == "session-test"
+      assert result.turn_id == "assistant-message-6"
 
       assert_receive {:fake_opencode_request, {:message_post, "session-test", _body}}, 1_000
       assert_receive {:agent_message, %{event: :turn_started, session_id: "session-test"}}, 1_000
       assert_receive {:agent_message, %{event: "message.part.delta"}}, 1_000
+      assert_receive {:agent_message, %{event: :turn_completed}}, 1_000
+    after
+      File.rm_rf(test_root)
+    end
+  end
 
-      assert_receive {:agent_message, %{event: :turn_ended_with_error, reason: %{kind: :message_post_timeout, message: ^message}}},
-                     1_000
+  test "app server event stream uses read timeout instead of short request timeout" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-stream-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STREAM")
+      File.mkdir_p!(workspace)
+
+      server = start_fake_opencode_server!(:quiet_event_stream)
+      launcher = write_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        opencode_request_timeout_ms: 50,
+        opencode_read_timeout_ms: 2_000,
+        opencode_turn_timeout_ms: 5_000,
+        opencode_stall_timeout_ms: 5_000
+      )
+
+      assert {:ok, result} =
+               AppServer.run(
+                 workspace,
+                 "Wait for stream",
+                 issue_fixture("issue-stream-timeout", "MT-STREAM", "Stream timeout")
+               )
+
+      assert result.turn_id == "assistant-message-7"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server terminates launcher and descendant serve processes when startup times out" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CLEANUP")
+      pid_file = Path.join(test_root, "serve.pid")
+      File.mkdir_p!(workspace)
+
+      launcher = write_stuck_launcher_script!(test_root, pid_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        opencode_startup_timeout_ms: 500,
+        opencode_request_timeout_ms: 100
+      )
+
+      assert {:error, %{kind: :server_start_timeout, startup_timeout_ms: 500}} =
+               AppServer.run(workspace, "timeout", issue_fixture("issue-cleanup", "MT-CLEANUP", "Cleanup"))
+
+      assert File.exists?(pid_file)
+      child_pid = pid_file |> File.read!() |> String.trim()
+      refute os_process_alive?(child_pid)
     after
       File.rm_rf(test_root)
     end
@@ -796,4 +868,30 @@ defmodule SymphonyElixir.AppServerTest do
     File.chmod!(launcher, 0o755)
     launcher
   end
+
+  defp write_stuck_launcher_script!(test_root, pid_file) do
+    launcher = Path.join(test_root, "fake-stuck-opencode-launcher.sh")
+
+    File.write!(launcher, """
+    #!/bin/sh
+    trap 'kill "$child" 2>/dev/null; exit 0' TERM INT EXIT
+    sh -c 'sleep 30 & printf "%s\\n" "$!" > "#{pid_file}"; wait' &
+    child=$!
+    while [ ! -s "#{pid_file}" ]; do
+      sleep 0.01
+    done
+    printf 'pid file ready #{pid_file}\\n'
+    wait "$child"
+    """)
+
+    File.chmod!(launcher, 0o755)
+    launcher
+  end
+
+  defp os_process_alive?(pid_string) when is_binary(pid_string) and pid_string != "" do
+    {_, status} = System.cmd("kill", ["-0", pid_string], stderr_to_stdout: true)
+    status == 0
+  end
+
+  defp os_process_alive?(_pid_string), do: false
 end

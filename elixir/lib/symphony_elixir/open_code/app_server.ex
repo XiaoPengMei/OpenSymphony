@@ -28,10 +28,12 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   @stream_idle_poll_ms 250
   @post_message_listener_drain_ms 100
   @port_log_preview_bytes 1_000
+  @process_cleanup_wait_ms 250
 
   @type session :: %{
           port: port(),
           request: Req.Request.t(),
+          stream_request: Req.Request.t(),
           base_url: String.t(),
           session_id: String.t(),
           metadata: map(),
@@ -40,6 +42,8 @@ defmodule SymphonyElixir.OpenCode.AppServer do
           model: String.t() | nil,
           variant: String.t() | nil,
           read_timeout_ms: pos_integer(),
+          startup_timeout_ms: pos_integer(),
+          request_timeout_ms: pos_integer(),
           turn_timeout_ms: pos_integer(),
           stall_timeout_ms: non_neg_integer()
         }
@@ -66,17 +70,18 @@ defmodule SymphonyElixir.OpenCode.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host, settings.command, issue) do
       metadata = port_metadata(port)
       startup_context = startup_context(expanded_workspace, settings, metadata)
-      read_timeout_ms = settings.read_timeout_ms
 
       with {:ok, base_url} <- await_server_url(port, startup_context, ""),
            request_context <- Map.put(startup_context, :base_url, base_url),
-           request <- build_request(base_url, read_timeout_ms),
+           request <- build_request(base_url, settings.request_timeout_ms),
+           stream_request <- build_request(base_url, settings.read_timeout_ms),
            :ok <- await_health(request, request_context),
            {:ok, session_id} <- create_session(request, expanded_workspace, request_context) do
         {:ok,
          %{
            port: port,
            request: request,
+           stream_request: stream_request,
            base_url: base_url,
            session_id: session_id,
            metadata: metadata,
@@ -84,7 +89,9 @@ defmodule SymphonyElixir.OpenCode.AppServer do
            agent: settings.agent,
            model: settings.model,
            variant: settings.variant,
-           read_timeout_ms: read_timeout_ms,
+           read_timeout_ms: settings.read_timeout_ms,
+           startup_timeout_ms: settings.startup_timeout_ms,
+           request_timeout_ms: settings.request_timeout_ms,
            turn_timeout_ms: settings.turn_timeout_ms,
            stall_timeout_ms: settings.stall_timeout_ms
          }}
@@ -259,6 +266,8 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       model: settings.model,
       variant: settings.variant,
       read_timeout_ms: settings.read_timeout_ms,
+      startup_timeout_ms: settings.startup_timeout_ms,
+      request_timeout_ms: settings.request_timeout_ms,
       turn_timeout_ms: settings.turn_timeout_ms,
       stall_timeout_ms: settings.stall_timeout_ms
     })
@@ -277,6 +286,8 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       model: session.model,
       variant: session.variant,
       read_timeout_ms: session.read_timeout_ms,
+      startup_timeout_ms: session.startup_timeout_ms,
+      request_timeout_ms: session.request_timeout_ms,
       turn_timeout_ms: session.turn_timeout_ms,
       stall_timeout_ms: session.stall_timeout_ms
     })
@@ -322,12 +333,12 @@ defmodule SymphonyElixir.OpenCode.AppServer do
            })
          )}
     after
-      Map.fetch!(context, :read_timeout_ms) ->
+      Map.fetch!(context, :startup_timeout_ms) ->
         {:error,
          opencode_error(
            :server_start_timeout,
            :server_startup,
-           "OpenCode did not announce its listening URL before read_timeout_ms elapsed",
+           "OpenCode did not announce its listening URL before startup_timeout_ms elapsed",
            Map.put(
              context,
              :hint,
@@ -357,7 +368,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   end
 
   defp await_health(request, context) do
-    deadline = System.monotonic_time(:millisecond) + Map.fetch!(context, :read_timeout_ms)
+    deadline = System.monotonic_time(:millisecond) + Map.fetch!(context, :request_timeout_ms)
     await_health_until(request, deadline, context)
   end
 
@@ -421,7 +432,9 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       |> maybe_put_model(session.model)
       |> maybe_put_variant(session.variant)
 
-    case Req.post(session.request,
+    message_request = Req.Request.put_option(session.request, :receive_timeout, session.turn_timeout_ms)
+
+    case Req.post(message_request,
            url: path,
            body: Jason.encode!(payload),
            headers: %{"content-type" => "application/json"}
@@ -635,7 +648,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
   defp stream_session_events(session, turn_ref, owner, on_message) do
     response =
-      Req.get!(session.request,
+      Req.get!(session.stream_request,
         url: "/global/event",
         decode_body: false,
         into: :self,
@@ -1004,12 +1017,112 @@ defmodule SymphonyElixir.OpenCode.AppServer do
   defp resolve_timeout_reason(timeout_reason), do: timeout_reason
 
   defp stop_port(port) when is_port(port) do
+    metadata = port_metadata(port)
+    agent_server_pid = Map.get(metadata, :agent_server_pid)
+    descendants = descendant_os_pids(agent_server_pid)
+
+    close_port(port)
+    cleanup_process_tree(agent_server_pid, descendants)
+    :ok
+  end
+
+  defp close_port(port) when is_port(port) do
     Port.close(port)
     :ok
   rescue
-    _error ->
-      :ok
+    _error -> :ok
   end
+
+  defp cleanup_process_tree(nil, _descendants), do: :ok
+
+  defp cleanup_process_tree(pid_string, initial_descendants) when is_binary(pid_string) do
+    initial_targets = Enum.uniq(List.wrap(initial_descendants) ++ descendant_os_pids(pid_string))
+
+    terminate_os_processes(initial_targets, "TERM")
+
+    terminate_os_processes([pid_string], "TERM")
+    Process.sleep(@process_cleanup_wait_ms)
+
+    kill_targets =
+      (initial_targets ++ descendant_os_pids(pid_string) ++ [pid_string])
+      |> Enum.uniq()
+      |> Enum.filter(&os_process_alive?/1)
+
+    terminate_os_processes(kill_targets, "KILL")
+
+    :ok
+  rescue
+    _error -> :ok
+  end
+
+  defp cleanup_process_tree(_pid_string, _descendants), do: :ok
+
+  defp terminate_os_processes(pid_strings, signal) when is_list(pid_strings) do
+    if System.find_executable("kill") do
+      pid_strings
+      |> Enum.uniq()
+      |> Enum.filter(&valid_os_pid?/1)
+      |> Enum.each(fn pid_string ->
+        {_output, _status} = System.cmd("kill", ["-#{signal}", pid_string], stderr_to_stdout: true)
+      end)
+    end
+
+    :ok
+  end
+
+  defp descendant_os_pids(nil), do: []
+
+  defp descendant_os_pids(pid_string) when is_binary(pid_string) do
+    pid_string
+    |> child_os_pids()
+    |> collect_descendant_os_pids([])
+  end
+
+  defp collect_descendant_os_pids([], acc), do: acc
+
+  defp collect_descendant_os_pids([pid_string | rest], acc) do
+    descendants = child_os_pids(pid_string)
+    collect_descendant_os_pids(rest ++ descendants, [pid_string | acc])
+  end
+
+  defp child_os_pids(pid_string) when is_binary(pid_string) do
+    cond do
+      !valid_os_pid?(pid_string) ->
+        []
+
+      System.find_executable("pgrep") ->
+        {output, status} = System.cmd("pgrep", ["-P", pid_string], stderr_to_stdout: true)
+
+        if status == 0 do
+          output
+          |> String.split("\n", trim: true)
+          |> Enum.map(&String.trim/1)
+          |> Enum.filter(&valid_os_pid?/1)
+        else
+          []
+        end
+
+      true ->
+        []
+    end
+  end
+
+  defp valid_os_pid?(pid_string) when is_binary(pid_string) do
+    String.match?(pid_string, ~r/^\d+$/)
+  end
+
+  defp valid_os_pid?(_pid_string), do: false
+
+  defp os_process_alive?(pid_string) when is_binary(pid_string) and pid_string != "" do
+    if System.find_executable("kill") do
+      {_output, status} = System.cmd("kill", ["-0", pid_string], stderr_to_stdout: true)
+      status == 0
+    else
+      false
+    end
+  end
+
+  defp os_process_alive?(_pid_string), do: false
 
   defp log_port_output(stream_label, line) when is_binary(line) do
     text =
@@ -1060,12 +1173,12 @@ defmodule SymphonyElixir.OpenCode.AppServer do
       opencode_error(
         request_timeout_kind(phase),
         phase,
-        "OpenCode did not respond to #{method} #{path} before read_timeout_ms elapsed",
+        request_timeout_message(phase, method, path),
         Map.merge(context, %{
           method: method,
           path: path,
           transport_reason: transport_reason,
-          hint: "Increase opencode.read_timeout_ms or verify the provider/model can answer within that window."
+          hint: request_timeout_hint(phase)
         })
       )
     else
@@ -1084,11 +1197,27 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     end
   end
 
+  defp request_timeout_message(:post_turn_message, method, path) do
+    "OpenCode did not respond to #{method} #{path} before turn_timeout_ms elapsed"
+  end
+
+  defp request_timeout_message(_phase, method, path) do
+    "OpenCode did not respond to #{method} #{path} before request_timeout_ms elapsed"
+  end
+
+  defp request_timeout_hint(:post_turn_message) do
+    "Increase opencode.turn_timeout_ms or verify the provider/model can finish the turn within that window."
+  end
+
+  defp request_timeout_hint(_phase) do
+    "Increase opencode.request_timeout_ms or verify the provider/model can answer within that window."
+  end
+
   defp healthcheck_response_error(context, %{status: status, body: body}) do
     opencode_error(
       :healthcheck_timeout,
       :healthcheck,
-      "OpenCode never reported healthy before read_timeout_ms elapsed",
+      "OpenCode never reported healthy before request_timeout_ms elapsed",
       Map.merge(context, %{
         method: "GET",
         path: "/global/health",
@@ -1103,7 +1232,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
     opencode_error(
       :healthcheck_timeout,
       :healthcheck,
-      "OpenCode never reported healthy before read_timeout_ms elapsed",
+      "OpenCode never reported healthy before request_timeout_ms elapsed",
       Map.merge(context, %{
         method: "GET",
         path: "/global/health",
@@ -1124,7 +1253,7 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
     message =
       case transport_reason do
-        :timeout -> "OpenCode did not respond to GET /global/health before read_timeout_ms elapsed"
+        :timeout -> "OpenCode did not respond to GET /global/health before request_timeout_ms elapsed"
         _ -> "OpenCode healthcheck request failed"
       end
 

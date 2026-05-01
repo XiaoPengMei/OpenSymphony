@@ -88,7 +88,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Status map
 
 - `Backlog` -> out of scope for this workflow; do not modify.
-- `Todo` -> queued; immediately transition to `In Progress` before active work.
+- `Todo` -> Symphony preflight queue; the daemon must comment, transition to `In Progress`, and
+  refetch before active work starts. Agent sessions should normally begin after the issue is already
+  `In Progress`.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
@@ -102,7 +104,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 2. Read the current state.
 3. Route to the matching flow:
    - `Backlog` -> do not modify issue content/state; stop and wait for human to move it to `Todo`.
-   - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
+   - `Todo` -> do not start implementation from inside an agent session. Symphony preflight should
+     first comment, move the issue to `In Progress`, and refetch it; if an agent still sees `Todo`,
+     stop and wait for preflight or human promotion.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Human Review` -> wait and poll for decision/review updates.
@@ -112,10 +116,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 4. Check whether a PR already exists for the current branch and whether it is closed.
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
-5. For `Todo` tickets, do startup sequencing in this exact order:
-   - `update_issue(..., state: "In Progress")`
-   - find/create `## Symphony Workpad` bootstrap comment
-   - only then begin analysis/planning/implementation work.
+5. For `Todo` tickets, do not create the workpad or start implementation directly. The daemon
+   preflight sequence is: preflight comment, `update_issue(..., state: "In Progress")`, refetch,
+   then agent execution only if the refreshed state is executable.
 6. Add a short comment if state and issue content are inconsistent, then proceed with the safest flow.
 
 ## Step 1: Start/continue execution (Todo or In Progress)
@@ -308,4 +311,3 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
-

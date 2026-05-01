@@ -98,6 +98,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:preflight_states, {:array, :string}, default: ["Todo"])
+      field(:execution_states, {:array, :string}, default: ["In Progress"])
+      field(:preflight_target_state, :string, default: "In Progress")
+      field(:preflight_required_label, :string, default: "agent-ready")
       field(:terminal_states, {:array, :string}, default: ["Backlog", "Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
       embeds_many(:projects, TrackerProject, on_replace: :delete)
     end
@@ -107,12 +111,27 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :assignee,
+          :active_states,
+          :preflight_states,
+          :execution_states,
+          :preflight_target_state,
+          :preflight_required_label,
+          :terminal_states
+        ],
         empty_values: []
       )
       |> update_change(:kind, &Schema.normalize_optional_string/1)
       |> update_change(:project_slug, &Schema.normalize_optional_string/1)
       |> update_change(:assignee, &Schema.normalize_optional_string/1)
+      |> update_change(:preflight_target_state, &Schema.normalize_optional_string/1)
+      |> update_change(:preflight_required_label, &Schema.normalize_optional_string/1)
+      |> validate_required([:preflight_target_state])
       |> cast_embed(:projects, with: &TrackerProject.changeset/2)
       |> Schema.validate_unique_tracker_projects()
     end

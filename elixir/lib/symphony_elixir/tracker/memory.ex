@@ -43,9 +43,24 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
+    maybe_apply_state_update(issue_id, state_name)
     send_event({:memory_tracker_state_update, issue_id, state_name})
     :ok
   end
+
+  defp maybe_apply_state_update(issue_id, state_name) when is_binary(issue_id) and is_binary(state_name) do
+    if Application.get_env(:symphony_elixir, :memory_tracker_apply_state_updates, false) do
+      updated_issues =
+        Enum.map(configured_issues(), fn
+          %Issue{id: ^issue_id} = issue -> %{issue | state: state_name}
+          issue -> issue
+        end)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, updated_issues)
+    end
+  end
+
+  defp maybe_apply_state_update(_issue_id, _state_name), do: :ok
 
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])

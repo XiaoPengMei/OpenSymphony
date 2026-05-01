@@ -106,19 +106,25 @@ tracker:
   kind: linear
   endpoint: https://api.linear.app/graphql
   api_key: $LINEAR_API_KEY
-providers:
-  openrouter_api_key: $OPENROUTER_API_KEY
   active_states:
     - Todo
     - In Progress
     - Merging
     - Rework
+  preflight_states:
+    - Todo
+  execution_states:
+    - In Progress
+  preflight_target_state: In Progress
+  preflight_required_label: agent-ready
   terminal_states:
     - Closed
     - Cancelled
     - Canceled
     - Duplicate
     - Done
+providers:
+  openrouter_api_key: $OPENROUTER_API_KEY
 
 polling:
   interval_ms: 5000
@@ -206,6 +212,11 @@ For the example config above, active states are:
 - `In Progress`
 - `Merging`
 - `Rework`
+
+`Todo` is a preflight state, not an execution state. A `Todo` ticket must carry the configured
+`agent-ready` label before Symphony comments on it and promotes it to `In Progress`; after promotion,
+Symphony refetches the issue and only starts an agent if the refreshed state is in `execution_states`.
+Remove `agent-ready` from broad parent/tracking issues to keep them in `Todo` without token spend.
 
 ## 5. Start Symphony
 

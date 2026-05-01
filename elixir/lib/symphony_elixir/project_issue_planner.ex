@@ -11,12 +11,13 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
   alias SymphonyElixir.Linear.Issue
 
   @callback plan_project_issues(String.t(), [Issue.t()], keyword()) ::
-              {:ok, [String.t()]} | {:error, term()}
+              {:ok, [[String.t()]]} | {:error, term()}
 
   @schema_version 1
+  @planner_turn_timeout_ms 10_000
 
   @spec plan_project_issues(String.t(), [Issue.t()], keyword()) ::
-          {:ok, [String.t()]} | {:error, term()}
+          {:ok, [[String.t()]]} | {:error, term()}
   def plan_project_issues(project_key, issues, _opts \\ [])
       when is_binary(project_key) and is_list(issues) do
     with {:ok, workspace} <- create_planner_workspace(project_key),
@@ -24,14 +25,10 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
          planner_issue <- planner_issue(project_key, issues),
          {:ok, session} <- AppServer.start_session(workspace, backend: "opencode", issue: planner_issue) do
       try do
-        with {:ok, turn} <-
-               AppServer.run_turn(session, prompt, planner_issue,
-                 backend: "opencode",
-                 format: planner_format_schema()
-               ),
+        with {:ok, turn} <- run_planner_turn(session, prompt, planner_issue),
              {:ok, payload} <- extract_plan_payload(turn),
-             {:ok, ordered_issue_ids} <- validate_plan(project_key, issues, payload) do
-          {:ok, ordered_issue_ids}
+             {:ok, issue_id_waves} <- validate_plan(project_key, issues, payload) do
+          {:ok, enforce_surface_safe_waves(issues, issue_id_waves)}
         end
       after
         AppServer.stop_session(session, backend: "opencode")
@@ -40,7 +37,7 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
   end
 
   @spec validate_plan(String.t(), [Issue.t()], map() | String.t()) ::
-          {:ok, [String.t()]} | {:error, term()}
+          {:ok, [[String.t()]]} | {:error, term()}
   def validate_plan(project_key, issues, payload) when is_binary(payload) do
     case Jason.decode(payload) do
       {:ok, decoded} -> validate_plan(project_key, issues, decoded)
@@ -55,11 +52,12 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
          :ok <- validate_project_key(project_key, payload),
          {:ok, batches} <- fetch_batches(payload),
          {:ok, deferred_ids} <- fetch_optional_issue_ids(payload, "defer_issue_ids"),
-         {:ok, ordered_ids} <- issue_ids_from_batches(batches),
-         :ok <- validate_known_ids(ordered_ids ++ deferred_ids, known_ids),
-         :ok <- validate_no_duplicates(ordered_ids ++ deferred_ids),
-         :ok <- validate_complete_coverage(ordered_ids ++ deferred_ids, known_ids) do
-      {:ok, ordered_ids}
+         {:ok, issue_id_waves} <- issue_id_waves_from_batches(batches),
+         planned_ids <- List.flatten(issue_id_waves),
+         :ok <- validate_known_ids(planned_ids ++ deferred_ids, known_ids),
+         :ok <- validate_no_duplicates(planned_ids ++ deferred_ids),
+         :ok <- validate_complete_coverage(planned_ids ++ deferred_ids, known_ids) do
+      {:ok, enforce_surface_safe_waves(issues, issue_id_waves)}
     end
   end
 
@@ -86,7 +84,7 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
     """
     You are OpenSymphony's project-scoped dispatch planner.
 
-    Decide which issues in this single Linear project can safely run now and in what parallel batch order.
+    Decide which issues in this single Linear project can safely run now and in what parallel wave order.
     You must not edit files, run shell commands, claim issues, update Linear, or start implementation work.
 
     Project key: #{project_key}
@@ -94,7 +92,10 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
     Rules:
     - Return only data matching the provided JSON schema.
     - Use hard Linear blockers as dependencies.
+    - Each batch is a wave. Issues in the same wave may run concurrently.
+    - Later waves are serial and must wait until all earlier-wave issues finish.
     - Prefer safe parallelism only when issues do not conflict on the same implementation surface.
+    - Put issues that touch the same surface, depend on each other, or could race on the same files in different waves.
     - Put issues that should not run now in defer_issue_ids.
     - Every input issue id must appear exactly once, either in a batch issue_ids list or defer_issue_ids.
 
@@ -147,6 +148,21 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
     }
   end
 
+  defp run_planner_turn(session, prompt, planner_issue) do
+    task =
+      Task.async(fn ->
+        AppServer.run_turn(session, prompt, planner_issue,
+          backend: "opencode",
+          format: planner_format_schema()
+        )
+      end)
+
+    case Task.yield(task, @planner_turn_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> {:error, :planner_timeout}
+    end
+  end
+
   defp extract_plan_payload(%{result: result}), do: extract_plan_payload(result)
   defp extract_plan_payload(%{"result" => result}), do: extract_plan_payload(result)
 
@@ -175,14 +191,19 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
     end
   end
 
-  defp issue_ids_from_batches(batches) when is_list(batches) do
+  defp issue_id_waves_from_batches(batches) when is_list(batches) do
     Enum.reduce_while(batches, {:ok, []}, fn batch, {:ok, acc} ->
       case batch do
         %{"issue_ids" => ids} when is_list(ids) ->
-          if Enum.all?(ids, &is_binary/1) do
-            {:cont, {:ok, acc ++ ids}}
-          else
-            {:halt, {:error, {:invalid_batch_issue_ids, ids}}}
+          cond do
+            ids == [] ->
+              {:halt, {:error, {:empty_batch_issue_ids, batch}}}
+
+            Enum.all?(ids, &is_binary/1) ->
+              {:cont, {:ok, acc ++ [ids]}}
+
+            true ->
+              {:halt, {:error, {:invalid_batch_issue_ids, ids}}}
           end
 
         _ ->
@@ -232,6 +253,70 @@ defmodule SymphonyElixir.ProjectIssuePlanner do
       created_at: maybe_datetime(issue.created_at),
       updated_at: maybe_datetime(issue.updated_at)
     }
+  end
+
+  defp enforce_surface_safe_waves(issues, issue_id_waves) when is_list(issues) and is_list(issue_id_waves) do
+    issue_by_id = Map.new(issues, &{&1.id, &1})
+
+    Enum.flat_map(issue_id_waves, fn issue_ids ->
+      split_wave_by_surface(issue_ids, issue_by_id)
+    end)
+  end
+
+  defp split_wave_by_surface(issue_ids, issue_by_id) do
+    {waves, current_wave, _current_surfaces} =
+      Enum.reduce(issue_ids, {[], [], MapSet.new()}, fn issue_id, {waves, current_wave, current_surfaces} ->
+        surfaces = issue_by_id |> Map.get(issue_id) |> issue_surfaces()
+
+        if surfaces_overlap?(surfaces, current_surfaces) do
+          {waves ++ [current_wave], [issue_id], surfaces}
+        else
+          {waves, current_wave ++ [issue_id], MapSet.union(current_surfaces, surfaces)}
+        end
+      end)
+
+    waves ++ [current_wave]
+  end
+
+  defp issue_surfaces(%Issue{} = issue) do
+    text =
+      [issue.title, issue.description | issue.labels || []]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    surface_keywords = [
+      {:web, ["web", "网页", "页面", "react", "vite", "pwa", "h5"]},
+      {:api, ["api", "backend", "后端", "fastify", "prisma", "database", "数据库"]},
+      {:backoffice, ["backoffice", "后台", "admin", "管理台"]},
+      {:replenishment_pc, ["replenishment", "pc", "补货", "桌面"]}
+    ]
+
+    surfaces =
+      surface_keywords
+      |> Enum.reduce(MapSet.new(), fn {surface, keywords}, surfaces ->
+        if Enum.any?(keywords, &String.contains?(text, &1)) do
+          MapSet.put(surfaces, surface)
+        else
+          surfaces
+        end
+      end)
+
+    android_keywords = ["android", "安卓", "kotlin", "compose", "gradle", "room", "webview"]
+    strong_android_keywords = ["kotlin", "compose", "gradle", "room", "webview"]
+
+    if Enum.any?(strong_android_keywords, &String.contains?(text, &1)) or
+         (not MapSet.member?(surfaces, :web) and Enum.any?(android_keywords, &String.contains?(text, &1))) do
+      MapSet.put(surfaces, :android)
+    else
+      surfaces
+    end
+  end
+
+  defp issue_surfaces(_issue), do: MapSet.new()
+
+  defp surfaces_overlap?(surfaces, current_surfaces) do
+    MapSet.size(surfaces) > 0 and not MapSet.disjoint?(surfaces, current_surfaces)
   end
 
   defp issue_ids(issues) do

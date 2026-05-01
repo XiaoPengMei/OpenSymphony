@@ -57,6 +57,7 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :startup_mode)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_apply_state_updates)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
           Application.delete_env(:symphony_elixir, :project_issue_planner)
           Application.delete_env(:symphony_elixir, :planner_test_recipient)
@@ -156,6 +157,10 @@ defmodule SymphonyElixir.TestSupport do
           tracker_projects: nil,
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
+          tracker_preflight_states: ["Todo"],
+          tracker_execution_states: ["In Progress"],
+          tracker_preflight_target_state: "In Progress",
+          tracker_preflight_required_label: "agent-ready",
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
@@ -240,6 +245,10 @@ defmodule SymphonyElixir.TestSupport do
     tracker_projects = Keyword.get(config, :tracker_projects)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
+    tracker_preflight_states = Keyword.get(config, :tracker_preflight_states)
+    tracker_execution_states = Keyword.get(config, :tracker_execution_states)
+    tracker_preflight_target_state = Keyword.get(config, :tracker_preflight_target_state)
+    tracker_preflight_required_label = Keyword.get(config, :tracker_preflight_required_label)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
@@ -325,6 +334,10 @@ defmodule SymphonyElixir.TestSupport do
         "  projects: #{yaml_value(tracker_projects)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
+        "  preflight_states: #{yaml_value(tracker_preflight_states)}",
+        "  execution_states: #{yaml_value(tracker_execution_states)}",
+        "  preflight_target_state: #{yaml_value(tracker_preflight_target_state)}",
+        "  preflight_required_label: #{yaml_value(tracker_preflight_required_label)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
@@ -462,6 +475,10 @@ defmodule SymphonyElixir.TestSupport do
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_active_states: ["Todo", "In Progress"],
+          tracker_preflight_states: ["Todo"],
+          tracker_execution_states: ["In Progress"],
+          tracker_preflight_target_state: "In Progress",
+          tracker_preflight_required_label: "agent-ready",
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
@@ -543,6 +560,10 @@ defmodule SymphonyElixir.TestSupport do
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
+    tracker_preflight_states = Keyword.get(config, :tracker_preflight_states)
+    tracker_execution_states = Keyword.get(config, :tracker_execution_states)
+    tracker_preflight_target_state = Keyword.get(config, :tracker_preflight_target_state)
+    tracker_preflight_required_label = Keyword.get(config, :tracker_preflight_required_label)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
@@ -634,6 +655,10 @@ defmodule SymphonyElixir.TestSupport do
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
+        "  preflight_states: #{yaml_value(tracker_preflight_states)}",
+        "  execution_states: #{yaml_value(tracker_execution_states)}",
+        "  preflight_target_state: #{yaml_value(tracker_preflight_target_state)}",
+        "  preflight_required_label: #{yaml_value(tracker_preflight_required_label)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",

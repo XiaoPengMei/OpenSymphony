@@ -71,7 +71,8 @@ Important boundary:
    - Performs validation used by the orchestrator before dispatch.
 
 3. `Issue Tracker Client`
-   - Fetches candidate issues in active states.
+- Fetches candidate issues in active states, then separates preflight-only states from execution
+  states before any workspace or agent process is started.
    - Fetches current states for specific issue IDs (reconciliation).
    - Fetches terminal-state issues during startup cleanup.
    - Normalizes tracker payloads into a stable issue model.
@@ -355,6 +356,20 @@ Fields:
   - Required for dispatch when `tracker.kind == "linear"`.
 - `active_states` (list of strings)
   - Default: `Todo`, `In Progress`
+- `preflight_states` (list of strings)
+  - Default: `Todo`
+  - Issues in these states are eligible only for preflight comments/state promotion, not direct
+    workspace or agent execution.
+- `execution_states` (list of strings)
+  - Default: `In Progress`
+  - Only issues in these states may create workspaces, invoke planners, or start agent runners.
+- `preflight_target_state` (string)
+  - Default: `In Progress`
+  - Must be a member of `execution_states`.
+- `preflight_required_label` (string or null)
+  - Default: `agent-ready`
+  - When set, a preflight-state issue missing this label is skipped without comment, state mutation,
+    planner invocation, workspace creation, or agent token spend.
 - `terminal_states` (list of strings)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
 
@@ -655,6 +670,10 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
 - `tracker.project_slug`: string, required when `tracker.kind=linear`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
+- `tracker.preflight_states`: list of strings, default `["Todo"]`
+- `tracker.execution_states`: list of strings, default `["In Progress"]`
+- `tracker.preflight_target_state`: string, default `"In Progress"`
+- `tracker.preflight_required_label`: string or null, default `"agent-ready"`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/symphony_workspaces`

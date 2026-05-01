@@ -714,12 +714,22 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "same-project multi-issue groups use planner order" do
     issues = [
-      %Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"},
-      %Issue{id: "issue-b", identifier: "B", title: "B", state: "Todo", project_id: "project-a"}
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "In Progress", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "In Progress", project_id: "project-a"}
     ]
 
     assert [%Issue{id: "issue-b"}, %Issue{id: "issue-a"}] =
              Orchestrator.planned_project_issue_order_for_test("id:project-a", issues, __MODULE__.ReversePlanner)
+  end
+
+  test "same-project multi-issue planner preserves waves" do
+    issues = [
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "In Progress", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "In Progress", project_id: "project-a"}
+    ]
+
+    assert [[%Issue{id: "issue-b"}], [%Issue{id: "issue-a"}]] =
+             Orchestrator.planned_project_issue_waves_for_test("id:project-a", issues, __MODULE__.SerialWavePlanner)
   end
 
   test "single-issue project groups bypass planner" do
@@ -734,8 +744,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     Application.put_env(:symphony_elixir, :planner_test_recipient, test_pid)
 
     issues = [
-      %Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"},
-      %Issue{id: "issue-b", identifier: "B", title: "B", state: "Todo", project_id: "project-a"}
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "In Progress", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "In Progress", project_id: "project-a"}
     ]
 
     assert [%Issue{id: "issue-a"}, %Issue{id: "issue-b"}] =
@@ -747,10 +757,32 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute_received {:planner_attempt, 4}
   end
 
+  test "todo multi-issue groups bypass planner to avoid preflight token spend" do
+    test_pid = self()
+    Application.put_env(:symphony_elixir, :planner_test_recipient, test_pid)
+
+    issues = [
+      %Issue{id: "issue-a", identifier: "A", title: "A", state: "Todo", project_id: "project-a"},
+      %Issue{id: "issue-b", identifier: "B", title: "B", state: "Todo", project_id: "project-a"}
+    ]
+
+    assert [%Issue{id: "issue-a"}, %Issue{id: "issue-b"}] =
+             Orchestrator.planned_project_issue_order_for_test("id:project-a", issues, __MODULE__.CountingFailingPlanner)
+
+    refute_received {:planner_attempt, _attempt}
+  end
+
   defmodule ReversePlanner do
-    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [String.t()]}
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [[String.t()]]}
     def plan_project_issues(_project_key, issues, _opts) do
-      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse()}
+      {:ok, [issues |> Enum.map(& &1.id) |> Enum.reverse()]}
+    end
+  end
+
+  defmodule SerialWavePlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [[String.t()]]}
+    def plan_project_issues(_project_key, issues, _opts) do
+      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse() |> Enum.map(&[&1])}
     end
   end
 
@@ -826,6 +858,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       identifier: "MT-1003",
       title: "Ready work",
       state: "Todo",
+      labels: ["agent-ready"],
       blocked_by: [%{id: "blocker-2", identifier: "MT-1004", state: "Closed"}]
     }
 
@@ -838,6 +871,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       identifier: "MT-1005",
       title: "Stale blocked work",
       state: "Todo",
+      labels: ["agent-ready"],
       blocked_by: []
     }
 
@@ -846,6 +880,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       identifier: "MT-1005",
       title: "Stale blocked work",
       state: "Todo",
+      labels: ["agent-ready"],
       blocked_by: [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
     }
 
@@ -1015,6 +1050,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.preflight_states == ["Todo"]
+    assert config.tracker.execution_states == ["In Progress"]
+    assert config.tracker.preflight_target_state == "In Progress"
+    assert config.tracker.preflight_required_label == "agent-ready"
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
@@ -1174,6 +1214,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert {:error, {:invalid_workflow_config, _message}} = Config.validate!()
+  end
+
+  test "validated config rejects contradictory tracker state gates" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_preflight_states: ["Todo"],
+      tracker_execution_states: ["In Progress"],
+      tracker_preflight_target_state: "Todo"
+    )
+
+    assert_raise ArgumentError, ~r/preflight_target_state must be included in tracker.execution_states/, fn ->
+      Config.validated_settings!()
+    end
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo"],
+      tracker_preflight_states: ["Todo"],
+      tracker_execution_states: ["In Progress"],
+      tracker_preflight_target_state: "In Progress"
+    )
+
+    assert_raise ArgumentError, ~r/execution_states must be included in tracker.active_states/, fn ->
+      Config.validated_settings!()
+    end
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do

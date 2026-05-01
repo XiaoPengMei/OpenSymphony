@@ -700,6 +700,13 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
+    with :ok <- validate_tracker_basics(settings),
+         :ok <- validate_tracker_state_semantics(settings) do
+      :ok
+    end
+  end
+
+  defp validate_tracker_basics(settings) do
     cond do
       is_nil(settings.tracker.kind) ->
         {:error, :missing_tracker_kind}
@@ -717,6 +724,49 @@ defmodule SymphonyElixir.Config do
         :ok
     end
   end
+
+  defp validate_tracker_state_semantics(settings) do
+    active_states = normalized_state_set(settings.tracker.active_states)
+    preflight_states = normalized_state_set(settings.tracker.preflight_states)
+    execution_states = normalized_state_set(settings.tracker.execution_states)
+    terminal_states = normalized_state_set(settings.tracker.terminal_states)
+    preflight_target_state = normalize_tracker_state(settings.tracker.preflight_target_state)
+
+    cond do
+      MapSet.size(execution_states) == 0 ->
+        {:error, {:invalid_tracker_states, "tracker.execution_states must include at least one state"}}
+
+      MapSet.size(preflight_states) == 0 ->
+        {:error, {:invalid_tracker_states, "tracker.preflight_states must include at least one state"}}
+
+      preflight_target_state == "" or not MapSet.member?(execution_states, preflight_target_state) ->
+        {:error, {:invalid_tracker_states, "tracker.preflight_target_state must be included in tracker.execution_states"}}
+
+      not MapSet.subset?(execution_states, active_states) ->
+        {:error, {:invalid_tracker_states, "tracker.execution_states must be included in tracker.active_states"}}
+
+      not MapSet.disjoint?(preflight_states, terminal_states) ->
+        {:error, {:invalid_tracker_states, "tracker.preflight_states must not overlap tracker.terminal_states"}}
+
+      not MapSet.disjoint?(execution_states, terminal_states) ->
+        {:error, {:invalid_tracker_states, "tracker.execution_states must not overlap tracker.terminal_states"}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp normalized_state_set(states) when is_list(states) do
+    states
+    |> Enum.map(&normalize_tracker_state/1)
+    |> Enum.reject(&(&1 == ""))
+    |> MapSet.new()
+  end
+
+  defp normalized_state_set(_states), do: MapSet.new()
+
+  defp normalize_tracker_state(state_name) when is_binary(state_name), do: state_name |> String.trim() |> String.downcase()
+  defp normalize_tracker_state(_state_name), do: ""
 
   defp validate_project_route_semantics(%Schema{} = settings) do
     if global_mode?() do
@@ -766,6 +816,9 @@ defmodule SymphonyElixir.Config do
 
       {:invalid_workflow_config, message} ->
         "Invalid #{config_source_name()} config: #{message}"
+
+      {:invalid_tracker_states, message} ->
+        "Invalid #{config_source_name()} tracker state config: #{message}"
 
       {:missing_workflow_file, path, raw_reason} ->
         "Missing WORKFLOW.md at #{path}: #{inspect(raw_reason)}"

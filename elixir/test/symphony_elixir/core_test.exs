@@ -14,6 +14,9 @@ defmodule SymphonyElixir.CoreTest do
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.preflight_states == ["Todo"]
+    assert config.tracker.execution_states == ["In Progress"]
+    assert config.tracker.preflight_target_state == "In Progress"
     assert config.tracker.terminal_states == ["Backlog", "Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
@@ -1086,6 +1089,89 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "same-project retry waits while another issue is active" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-project-retry-gate-#{System.unique_integer([:positive])}")
+    retry_issue_id = "issue-project-retry"
+    retry_token = make_ref()
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 10
+      )
+
+      running_issue = %Issue{
+        id: "issue-running",
+        identifier: "A-1",
+        title: "Active issue",
+        state: "In Progress",
+        project_id: "project-a"
+      }
+
+      retry_issue = %Issue{
+        id: retry_issue_id,
+        identifier: "B-1",
+        title: "Retry issue",
+        state: "In Progress",
+        project_id: "project-a"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [retry_issue])
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([retry_issue_id]),
+        running: %{
+          running_issue.id => %{
+            issue: running_issue,
+            identifier: running_issue.identifier,
+            task: self(),
+            started_at: DateTime.utc_now(),
+            backend: :opencode,
+            effort: nil,
+            worker_host: nil,
+            workspace_path: Path.join(workspace_root, running_issue.identifier),
+            attempt: 1
+          }
+        },
+        retry_attempts: %{
+          retry_issue_id => %{
+            attempt: 1,
+            retry_token: retry_token,
+            timer_ref: nil,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: retry_issue.identifier,
+            worker_host: nil,
+            workspace_path: Path.join(workspace_root, retry_issue.identifier),
+            project_id: retry_issue.project_id,
+            project_slug: retry_issue.project_slug,
+            project_name: retry_issue.project_name
+          }
+        },
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 10
+      }
+
+      assert {:noreply, updated_state} = Orchestrator.handle_info({:retry_issue, retry_issue_id, retry_token}, state)
+
+      assert Map.has_key?(updated_state.running, running_issue.id)
+      refute Map.has_key?(updated_state.running, retry_issue_id)
+      assert %{attempt: 2} = updated_state.retry_attempts[retry_issue_id]
+      assert __MODULE__.FakeOpenCodeState.message_posts(server.state) == []
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "continuation retry cleans workspace when issue is terminal" do
     test_root =
       Path.join(
@@ -1321,6 +1407,53 @@ defmodule SymphonyElixir.CoreTest do
       if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
       Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
       File.rm_rf(test_root)
+    end
+  end
+
+  test "running issue moved back to todo stops instead of staying executable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_preflight_states: ["Todo"],
+      tracker_execution_states: ["In Progress"]
+    )
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    running_issue = %Issue{
+      id: "issue-running-back-to-todo",
+      identifier: "PF-4",
+      title: "Back to todo",
+      state: "In Progress"
+    }
+
+    try do
+      state = %Orchestrator.State{
+        running: %{
+          running_issue.id => %{
+            pid: worker_pid,
+            ref: make_ref(),
+            identifier: running_issue.identifier,
+            issue: running_issue,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([running_issue.id]),
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 1
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([%{running_issue | state: "Todo"}], state)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(updated_state.running, running_issue.id)
+      refute MapSet.member?(updated_state.claimed, running_issue.id)
+    after
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
     end
   end
 
@@ -1824,7 +1957,14 @@ defmodule SymphonyElixir.CoreTest do
                AgentRunner.run(
                  issue,
                  nil,
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 issue_state_fetcher: fn [_issue_id] ->
+                   attempt = Process.get(:agent_keep_workspace_fetch_count, 0) + 1
+                   Process.put(:agent_keep_workspace_fetch_count, attempt)
+
+                   state = if attempt == 1, do: "In Progress", else: "Done"
+
+                   {:ok, [%{issue | state: state}]}
+                 end
                )
 
       entries_after = MapSet.new(File.ls!(workspace_root))
@@ -1842,11 +1982,12 @@ defmodule SymphonyElixir.CoreTest do
       assert File.exists?(workspace)
       assert File.read!(Path.join(workspace, "README.md")) == "# test\n"
     after
+      Process.delete(:agent_keep_workspace_fetch_count)
       File.rm_rf(test_root)
     end
   end
 
-  test "orchestrator executes same-project issues in planner order" do
+  test "orchestrator only dispatches the first same-project planner wave" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1864,16 +2005,16 @@ defmodule SymphonyElixir.CoreTest do
         workspace_root: workspace_root,
         hook_after_create: "printf '# test\\n' > README.md",
         opencode_command: launcher,
-        max_concurrent_agents: 1,
+        max_concurrent_agents: 10,
         poll_interval_ms: 30_000,
         max_turns: 1,
         prompt: "Issue {{ issue.identifier }}: {{ issue.title }}"
       )
 
-      Application.put_env(:symphony_elixir, :project_issue_planner, __MODULE__.ReversePlanner)
+      Application.put_env(:symphony_elixir, :project_issue_planner, __MODULE__.SerialWavePlanner)
 
-      issue_a = %Issue{id: "issue-a", identifier: "A-1", title: "First issue", state: "Todo", project_id: "project-a"}
-      issue_b = %Issue{id: "issue-b", identifier: "B-1", title: "Second issue", state: "Todo", project_id: "project-a"}
+      issue_a = %Issue{id: "issue-a", identifier: "A-1", title: "First issue", state: "In Progress", project_id: "project-a"}
+      issue_b = %Issue{id: "issue-b", identifier: "B-1", title: "Second issue", state: "In Progress", project_id: "project-a"}
 
       Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue_a, issue_b])
 
@@ -1889,19 +2030,364 @@ defmodule SymphonyElixir.CoreTest do
       send(pid, :tick)
 
       assert :ok =
-               __MODULE__.FakeOpenCodeState.wait_until(server.state, fn current ->
-                 length(current.message_posts) == 1
-               end)
+               __MODULE__.FakeOpenCodeState.wait_until(
+                 server.state,
+                 fn current ->
+                   length(current.message_posts) == 1
+                 end,
+                 5_000
+               )
 
       [first_post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
       assert message_text(first_post) =~ "Second issue"
       refute message_text(first_post) =~ "First issue"
 
-      assert :ok = wait_until_orchestrator(pid, &(!Map.has_key?(&1.running, "issue-b")))
+      send(pid, :tick)
 
-      state_after_first = :sys.get_state(pid)
-      refute Map.has_key?(state_after_first.running, "issue-b")
-      assert MapSet.member?(state_after_first.claimed, "issue-b")
+      Process.sleep(100)
+
+      assert length(__MODULE__.FakeOpenCodeState.message_posts(server.state)) == 1
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "todo issue preflight comments and promotes before dispatch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-todo-preflight-dispatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1,
+        prompt: "Issue {{ issue.identifier }}: {{ issue.title }}"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+      Application.put_env(:symphony_elixir, :memory_tracker_apply_state_updates, true)
+
+      issue = %Issue{
+        id: "issue-preflight",
+        identifier: "PF-1",
+        title: "Preflight me",
+        state: "Todo",
+        labels: ["agent-ready"],
+        project_id: "project-a"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :TodoPreflightDispatchOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+
+      assert_receive {:memory_tracker_comment, "issue-preflight", comment}, 1_000
+      assert comment =~ "Symphony preflight checked PF-1"
+      assert comment =~ "Promoting this issue to `In Progress`"
+      assert_receive {:memory_tracker_state_update, "issue-preflight", "In Progress"}, 1_000
+
+      assert :ok =
+               __MODULE__.FakeOpenCodeState.wait_until(server.state, fn current ->
+                 length(current.message_posts) == 1
+               end)
+
+      [post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
+      assert message_text(post) =~ "Preflight me"
+      assert File.exists?(Path.join(workspace_root, "PF-1"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "todo preflight refetch that remains todo does not spawn worker" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-todo-preflight-stale-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-still-todo",
+        identifier: "PF-2",
+        title: "Still todo",
+        state: "Todo",
+        labels: ["agent-ready"],
+        project_id: "project-a"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :TodoPreflightStaleOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+
+      assert_receive {:memory_tracker_comment, "issue-still-todo", _comment}, 1_000
+      assert_receive {:memory_tracker_state_update, "issue-still-todo", "In Progress"}, 1_000
+      Process.sleep(100)
+
+      assert __MODULE__.FakeOpenCodeState.message_posts(server.state) == []
+      refute File.exists?(Path.join(workspace_root, "PF-2"))
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.running, "issue-still-todo")
+      refute MapSet.member?(state.claimed, "issue-still-todo")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "existing in progress issue dispatches without preflight" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-in-progress-dispatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1,
+        prompt: "Issue {{ issue.identifier }}: {{ issue.title }}"
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{id: "issue-in-progress", identifier: "IP-1", title: "Already executable", state: "In Progress", project_id: "project-a"}
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :InProgressDispatchOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+
+      assert :ok =
+               __MODULE__.FakeOpenCodeState.wait_until(server.state, fn current ->
+                 length(current.message_posts) == 1
+               end)
+
+      refute_received {:memory_tracker_comment, "issue-in-progress", _comment}
+      refute_received {:memory_tracker_state_update, "issue-in-progress", _state}
+      [post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
+      assert message_text(post) =~ "Already executable"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "blocked todo issue stays skipped without comment or worker" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-blocked-todo-preflight-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-blocked-todo",
+        identifier: "PF-3",
+        title: "Blocked todo",
+        state: "Todo",
+        labels: ["agent-ready"],
+        project_id: "project-a",
+        blocked_by: [%{id: "blocker", identifier: "BLK-1", state: "In Progress"}]
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :BlockedTodoPreflightOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+      Process.sleep(100)
+
+      refute_received {:memory_tracker_comment, "issue-blocked-todo", _comment}
+      refute_received {:memory_tracker_state_update, "issue-blocked-todo", _state}
+      assert __MODULE__.FakeOpenCodeState.message_posts(server.state) == []
+      refute File.exists?(Path.join(workspace_root, "PF-3"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "todo issue without preflight required label stays skipped without comment or worker" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-unready-todo-preflight-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 1,
+        poll_interval_ms: 30_000,
+        max_turns: 1
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      issue = %Issue{
+        id: "issue-unready-todo",
+        identifier: "PF-5",
+        title: "Tracking parent",
+        state: "Todo",
+        labels: [],
+        project_id: "project-a"
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :UnreadyTodoPreflightOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      send(pid, :tick)
+      Process.sleep(100)
+
+      refute_received {:memory_tracker_comment, "issue-unready-todo", _comment}
+      refute_received {:memory_tracker_state_update, "issue-unready-todo", _state}
+      assert __MODULE__.FakeOpenCodeState.message_posts(server.state) == []
+      refute File.exists?(Path.join(workspace_root, "PF-5"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "orchestrator dispatches same-wave same-project issues concurrently" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-planner-wave-dispatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+      server = start_fake_opencode_server!()
+      launcher = write_opencode_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "printf '# test\n' > README.md",
+        opencode_command: launcher,
+        max_concurrent_agents: 10,
+        poll_interval_ms: 30_000,
+        max_turns: 1,
+        prompt: "Issue {{ issue.identifier }}: {{ issue.title }}"
+      )
+
+      Application.put_env(:symphony_elixir, :project_issue_planner, __MODULE__.SingleWavePlanner)
+
+      issue_a = %Issue{id: "issue-a", identifier: "A-1", title: "First issue", state: "In Progress", project_id: "project-a"}
+      issue_b = %Issue{id: "issue-b", identifier: "B-1", title: "Second issue", state: "In Progress", project_id: "project-a"}
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue_a, issue_b])
+
+      orchestrator_name = Module.concat(__MODULE__, :PlannerWaveDispatchOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
 
       send(pid, :tick)
 
@@ -1910,11 +2396,24 @@ defmodule SymphonyElixir.CoreTest do
                  length(current.message_posts) == 2
                end)
 
-      [_first_post, second_post] = __MODULE__.FakeOpenCodeState.message_posts(server.state)
-      assert message_text(second_post) =~ "First issue"
+      prompts = server.state |> __MODULE__.FakeOpenCodeState.message_posts() |> Enum.map(&message_text/1)
+      assert Enum.any?(prompts, &(&1 =~ "First issue"))
+      assert Enum.any?(prompts, &(&1 =~ "Second issue"))
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "orchestrator splits overlapping same-surface issues out of an unsafe same-project wave" do
+    issues = [
+      %Issue{id: "issue-android-a", identifier: "A-1", title: "安卓版本控制", state: "In Progress", project_id: "project-a"},
+      %Issue{id: "issue-web", identifier: "W-1", title: "web端添加安卓下载页面", state: "In Progress", project_id: "project-a"},
+      %Issue{id: "issue-android-b", identifier: "A-2", title: "安卓生命周期 + 导航栈管理功能调整", state: "In Progress", project_id: "project-a"}
+    ]
+
+    assert [first_wave, second_wave] = Orchestrator.planned_project_issue_waves_for_test("id:project-a", issues, __MODULE__.SingleWavePlanner)
+    assert Enum.map(first_wave, & &1.id) == ["issue-android-a", "issue-web"]
+    assert Enum.map(second_wave, & &1.id) == ["issue-android-b"]
   end
 
   test "agent runner forwards timestamped agent updates to recipient" do
@@ -1942,7 +2441,14 @@ defmodule SymphonyElixir.CoreTest do
                AgentRunner.run(
                  issue,
                  self(),
-                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+                 issue_state_fetcher: fn [_issue_id] ->
+                   attempt = Process.get(:agent_update_fetch_count, 0) + 1
+                   Process.put(:agent_update_fetch_count, attempt)
+
+                   state = if attempt in [1, 2], do: "In Progress", else: "Done"
+
+                   {:ok, [%{issue | state: state}]}
+                 end
                )
 
       assert_receive {:worker_runtime_info, "issue-live-updates", %{workspace_path: workspace_path}}, 1_000
@@ -1964,6 +2470,7 @@ defmodule SymphonyElixir.CoreTest do
                       }},
                      1_000
     after
+      Process.delete(:agent_update_fetch_count)
       File.rm_rf(test_root)
     end
   end
@@ -1997,7 +2504,7 @@ defmodule SymphonyElixir.CoreTest do
         send(parent, {:issue_state_fetch, attempt})
 
         state =
-          if attempt == 1 do
+          if attempt in [1, 2] do
             "In Progress"
           else
             "Done"
@@ -2208,9 +2715,23 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   defmodule ReversePlanner do
-    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [String.t()]}
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [[String.t()]]}
     def plan_project_issues(_project_key, issues, _opts) do
-      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse()}
+      {:ok, [issues |> Enum.map(& &1.id) |> Enum.reverse()]}
+    end
+  end
+
+  defmodule SerialWavePlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [[String.t()]]}
+    def plan_project_issues(_project_key, issues, _opts) do
+      {:ok, issues |> Enum.map(& &1.id) |> Enum.reverse() |> Enum.map(&[&1])}
+    end
+  end
+
+  defmodule SingleWavePlanner do
+    @spec plan_project_issues(String.t(), [Issue.t()], keyword()) :: {:ok, [[String.t()]]}
+    def plan_project_issues(_project_key, issues, _opts) do
+      {:ok, [Enum.map(issues, & &1.id)]}
     end
   end
 
@@ -2321,24 +2842,6 @@ defmodule SymphonyElixir.CoreTest do
 
     File.chmod!(launcher, 0o755)
     launcher
-  end
-
-  defp wait_until_orchestrator(pid, predicate, timeout_ms \\ 1_000) when is_function(predicate, 1) do
-    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
-    do_wait_until_orchestrator(pid, predicate, deadline_ms)
-  end
-
-  defp do_wait_until_orchestrator(pid, predicate, deadline_ms) do
-    if predicate.(:sys.get_state(pid)) do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline_ms do
-        {:error, :timeout}
-      else
-        Process.sleep(10)
-        do_wait_until_orchestrator(pid, predicate, deadline_ms)
-      end
-    end
   end
 
   defp message_text(%{body: %{"parts" => [part | _]}}) when is_map(part) do

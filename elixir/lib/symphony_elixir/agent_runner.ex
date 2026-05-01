@@ -21,6 +21,8 @@ defmodule SymphonyElixir.AgentRunner do
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, agent_update_recipient \\ nil, opts \\ []) do
+    :ok = validate_initial_execution_issue!(issue, Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1))
+
     issue_config = Keyword.get(opts, :issue_config) || resolve_issue_config!(issue)
     route = Keyword.get(opts, :route) || AgentRoute.resolve(issue, issue_config.settings)
     account = Keyword.get(opts, :account)
@@ -267,11 +269,11 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous agent turn completed normally, but the Linear issue is still in an active state.
+    - The previous agent turn completed normally, but the Linear issue is still in an execution state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    - Focus on the remaining ticket work and do not end the turn while the issue stays executable unless you are truly blocked.
     """
   end
 
@@ -281,11 +283,11 @@ defmodule SymphonyElixir.AgentRunner do
     """
     Continuation guidance:
 
-    - The previous agent turn completed normally, but the Linear issue is still in an active state.
+    - The previous agent turn completed normally, but the Linear issue is still in an execution state.
     - This is continuation turn ##{turn_number} of #{max_turns} for the current agent run.
     - Resume from the current workspace and workpad state instead of restarting from scratch.
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-    - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+    - Focus on the remaining ticket work and do not end the turn while the issue stays executable unless you are truly blocked.
     """
   end
 
@@ -314,7 +316,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if active_issue_state?(refreshed_issue.state) do
+        if execution_issue_state?(refreshed_issue.state) do
           {:continue, refreshed_issue}
         else
           {:done, refreshed_issue}
@@ -330,14 +332,35 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
 
-  defp active_issue_state?(state_name) when is_binary(state_name) do
-    normalized_state = normalize_issue_state(state_name)
+  defp validate_initial_execution_issue!(%Issue{id: issue_id} = issue, issue_state_fetcher)
+       when is_binary(issue_id) and is_function(issue_state_fetcher, 1) do
+    case issue_state_fetcher.([issue_id]) do
+      {:ok, [%Issue{} = refreshed_issue | _]} ->
+        if execution_issue_state?(refreshed_issue.state) do
+          :ok
+        else
+          raise ArgumentError,
+                "Refusing to start agent for non-execution issue #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)}"
+        end
 
-    Config.settings!().tracker.active_states
-    |> Enum.any?(fn active_state -> normalize_issue_state(active_state) == normalized_state end)
+      {:ok, []} ->
+        raise ArgumentError, "Refusing to start agent for invisible issue #{issue_context(issue)}"
+
+      {:error, reason} ->
+        raise ArgumentError, "Refusing to start agent after issue state refresh failed for #{issue_context(issue)}: #{inspect(reason)}"
+    end
   end
 
-  defp active_issue_state?(_state_name), do: false
+  defp validate_initial_execution_issue!(_issue, _issue_state_fetcher), do: :ok
+
+  defp execution_issue_state?(state_name) when is_binary(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+
+    Config.settings!().tracker.execution_states
+    |> Enum.any?(fn execution_state -> normalize_issue_state(execution_state) == normalized_state end)
+  end
+
+  defp execution_issue_state?(_state_name), do: false
 
   defp selected_worker_host(nil, []), do: nil
 

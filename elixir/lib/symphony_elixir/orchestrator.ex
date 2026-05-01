@@ -295,7 +295,7 @@ defmodule SymphonyElixir.Orchestrator do
           issues
           |> reconcile_running_issue_states(
             state,
-            active_state_set(),
+            execution_state_set(),
             terminal_state_set()
           )
           |> reconcile_missing_running_issue_ids(running_ids, issues)
@@ -311,17 +311,17 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(issues, state, execution_state_set(), terminal_state_set())
   end
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_running_issue_states(issues, state, execution_state_set(), terminal_state_set())
   end
 
   @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
-    should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+    should_dispatch_issue?(issue, state, active_state_set(), execution_state_set(), terminal_state_set())
   end
 
   @doc false
@@ -329,7 +329,7 @@ defmodule SymphonyElixir.Orchestrator do
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
-    revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+    revalidate_issue_for_dispatch(issue, issue_fetcher, execution_state_set(), terminal_state_set())
   end
 
   @doc false
@@ -351,9 +351,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec planned_project_issue_waves_for_test(String.t(), [Issue.t()], module()) :: [[Issue.t()]]
+  def planned_project_issue_waves_for_test(project_key, issues, planner_module) do
+    planned_project_issue_waves(project_key, issues, planner_module)
+  end
+
+  @doc false
   @spec planned_project_issue_order_for_test(String.t(), [Issue.t()], module()) :: [Issue.t()]
   def planned_project_issue_order_for_test(project_key, issues, planner_module) do
-    planned_project_issue_order(project_key, issues, planner_module)
+    project_key
+    |> planned_project_issue_waves(issues, planner_module)
+    |> List.flatten()
   end
 
   @doc false
@@ -562,6 +570,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
+    execution_states = execution_state_set()
     terminal_states = terminal_state_set()
     planner_module = project_issue_planner_module()
 
@@ -569,21 +578,32 @@ defmodule SymphonyElixir.Orchestrator do
     |> sort_issues_for_dispatch()
     |> project_issue_groups()
     |> Enum.reduce_while(state, fn {project_key, project_issues}, state_acc ->
-      ordered_issues = planned_project_issue_order(project_key, project_issues, planner_module)
+      issue_waves = planned_project_issue_waves(project_key, project_issues, planner_module)
 
-      state_acc = dispatch_planned_issues(ordered_issues, state_acc, active_states, terminal_states)
+      state_acc = dispatch_planned_issue_waves(project_key, issue_waves, state_acc, active_states, execution_states, terminal_states)
 
       if available_slots(state_acc) <= 0, do: {:halt, state_acc}, else: {:cont, state_acc}
     end)
   end
 
-  defp dispatch_planned_issues(issues, state, active_states, terminal_states) when is_list(issues) do
+  defp dispatch_planned_issue_waves(project_key, issue_waves, state, active_states, execution_states, terminal_states)
+       when is_binary(project_key) and is_list(issue_waves) do
+    if project_has_active_work?(project_key, state) do
+      state
+    else
+      issue_waves
+      |> List.first([])
+      |> dispatch_planned_wave(state, active_states, execution_states, terminal_states)
+    end
+  end
+
+  defp dispatch_planned_wave(issues, state, active_states, execution_states, terminal_states) when is_list(issues) do
     Enum.reduce_while(issues, state, fn issue, state_acc ->
       cond do
         available_slots(state_acc) <= 0 ->
           {:halt, state_acc}
 
-        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+        should_dispatch_issue?(issue, state_acc, active_states, execution_states, terminal_states) ->
           {:cont, dispatch_issue(state_acc, issue)}
 
         true ->
@@ -603,21 +623,37 @@ defmodule SymphonyElixir.Orchestrator do
     |> then(fn {order, groups} -> Enum.map(order, &{&1, Map.fetch!(groups, &1)}) end)
   end
 
-  defp planned_project_issue_order(_project_key, [issue], _planner_module), do: [issue]
+  defp planned_project_issue_waves(_project_key, [issue], _planner_module), do: [[issue]]
 
-  defp planned_project_issue_order(project_key, issues, planner_module) when is_list(issues) do
-    case plan_project_issue_ids(project_key, issues, planner_module, 1) do
-      {:ok, ordered_issue_ids} -> order_issues_by_ids(issues, ordered_issue_ids)
-      {:error, _reason} -> issues
+  defp planned_project_issue_waves(project_key, issues, planner_module) when is_list(issues) do
+    if all_execution_issues?(issues, execution_state_set()) do
+      case plan_project_issue_ids(project_key, issues, planner_module, 1) do
+        {:ok, issue_id_waves} ->
+          issues
+          |> issue_waves_by_ids(issue_id_waves)
+          |> enforce_surface_safe_issue_waves()
+
+        {:error, _reason} ->
+          Enum.map(issues, &[&1])
+      end
+    else
+      Enum.map(issues, &[&1])
     end
+  end
+
+  defp all_execution_issues?(issues, execution_states) when is_list(issues) do
+    Enum.all?(issues, fn
+      %Issue{state: state_name} -> execution_issue_state?(state_name, execution_states)
+      _ -> false
+    end)
   end
 
   defp plan_project_issue_ids(project_key, issues, planner_module, attempt) when attempt <= @planner_max_attempts do
     case planner_module.plan_project_issues(project_key, issues, attempt: attempt, max_attempts: @planner_max_attempts) do
       {:ok, issue_ids} ->
         case validate_planned_issue_ids(issues, issue_ids) do
-          {:ok, validated_issue_ids} ->
-            {:ok, validated_issue_ids}
+          {:ok, validated_issue_id_waves} ->
+            {:ok, validated_issue_id_waves}
 
           {:error, reason} when attempt < @planner_max_attempts ->
             Logger.warning("Project issue planner returned invalid order project=#{project_key} attempt=#{attempt}/#{@planner_max_attempts} reason=#{inspect(reason)}")
@@ -627,6 +663,10 @@ defmodule SymphonyElixir.Orchestrator do
             Logger.warning("Project issue planner exhausted project=#{project_key} attempts=#{@planner_max_attempts} reason=#{inspect(reason)}; falling back to priority dispatch order")
             {:error, reason}
         end
+
+      {:error, :planner_timeout} ->
+        Logger.warning("Project issue planner timed out project=#{project_key}; falling back to priority dispatch order")
+        {:error, :planner_timeout}
 
       {:error, reason} when attempt < @planner_max_attempts ->
         Logger.warning("Project issue planner failed project=#{project_key} attempt=#{attempt}/#{@planner_max_attempts} reason=#{inspect(reason)}")
@@ -638,31 +678,114 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp validate_planned_issue_ids(issues, issue_ids) when is_list(issue_ids) do
+  defp validate_planned_issue_ids(issues, issue_id_waves) when is_list(issue_id_waves) do
+    issue_ids = List.flatten(issue_id_waves)
     known_ids = MapSet.new(issues, & &1.id)
     duplicate_ids = issue_ids -- Enum.uniq(issue_ids)
     unknown_ids = Enum.reject(issue_ids, &MapSet.member?(known_ids, &1))
+    missing_ids = issues |> Enum.map(& &1.id) |> Enum.reject(&(&1 in issue_ids))
 
     cond do
+      not Enum.all?(issue_id_waves, &valid_issue_id_wave?/1) -> {:error, {:invalid_planned_issue_waves, issue_id_waves}}
       duplicate_ids != [] -> {:error, {:duplicate_planned_issue_ids, Enum.uniq(duplicate_ids)}}
       unknown_ids != [] -> {:error, {:unknown_planned_issue_ids, unknown_ids}}
-      true -> {:ok, issue_ids}
+      missing_ids != [] -> {:error, {:missing_planned_issue_ids, missing_ids}}
+      true -> {:ok, issue_id_waves}
     end
   end
 
   defp validate_planned_issue_ids(_issues, issue_ids), do: {:error, {:invalid_planned_issue_ids, issue_ids}}
 
-  defp order_issues_by_ids(issues, issue_ids) do
+  defp valid_issue_id_wave?(issue_ids) when is_list(issue_ids) and issue_ids != [] do
+    Enum.all?(issue_ids, &is_binary/1)
+  end
+
+  defp valid_issue_id_wave?(_issue_ids), do: false
+
+  defp issue_waves_by_ids(issues, issue_id_waves) do
     issue_by_id = Map.new(issues, &{&1.id, &1})
 
-    issue_ids
-    |> Enum.flat_map(fn issue_id ->
-      case Map.fetch(issue_by_id, issue_id) do
-        {:ok, issue} -> [issue]
-        :error -> []
-      end
+    Enum.map(issue_id_waves, fn issue_ids ->
+      Enum.flat_map(issue_ids, fn issue_id ->
+        case Map.fetch(issue_by_id, issue_id) do
+          {:ok, issue} -> [issue]
+          :error -> []
+        end
+      end)
     end)
   end
+
+  defp enforce_surface_safe_issue_waves(issue_waves) when is_list(issue_waves) do
+    Enum.flat_map(issue_waves, &split_issue_wave_by_surface/1)
+  end
+
+  defp split_issue_wave_by_surface(issues) when is_list(issues) do
+    {waves, current_wave, _current_surfaces} =
+      Enum.reduce(issues, {[], [], MapSet.new()}, fn issue, {waves, current_wave, current_surfaces} ->
+        surfaces = issue_surfaces(issue)
+
+        if surfaces_overlap?(surfaces, current_surfaces) do
+          {waves ++ [current_wave], [issue], surfaces}
+        else
+          {waves, current_wave ++ [issue], MapSet.union(current_surfaces, surfaces)}
+        end
+      end)
+
+    waves ++ [current_wave]
+  end
+
+  defp issue_surfaces(%Issue{} = issue) do
+    text =
+      [issue.title, issue.description | issue.labels || []]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+      |> String.downcase()
+
+    surface_keywords = [
+      {:web, ["web", "网页", "页面", "react", "vite", "pwa", "h5"]},
+      {:api, ["api", "backend", "后端", "fastify", "prisma", "database", "数据库"]},
+      {:backoffice, ["backoffice", "后台", "admin", "管理台"]},
+      {:replenishment_pc, ["replenishment", "pc", "补货", "桌面"]}
+    ]
+
+    surfaces =
+      Enum.reduce(surface_keywords, MapSet.new(), fn {surface, keywords}, surfaces ->
+        if Enum.any?(keywords, &String.contains?(text, &1)) do
+          MapSet.put(surfaces, surface)
+        else
+          surfaces
+        end
+      end)
+
+    android_keywords = ["android", "安卓", "kotlin", "compose", "gradle", "room", "webview"]
+    strong_android_keywords = ["kotlin", "compose", "gradle", "room", "webview"]
+
+    if Enum.any?(strong_android_keywords, &String.contains?(text, &1)) or
+         (not MapSet.member?(surfaces, :web) and Enum.any?(android_keywords, &String.contains?(text, &1))) do
+      MapSet.put(surfaces, :android)
+    else
+      surfaces
+    end
+  end
+
+  defp surfaces_overlap?(surfaces, current_surfaces) do
+    MapSet.size(surfaces) > 0 and not MapSet.disjoint?(surfaces, current_surfaces)
+  end
+
+  defp project_has_active_work?(project_key, %State{} = state) do
+    Enum.any?(state.running, fn
+      {_issue_id, %{issue: %Issue{} = issue}} -> issue_project_group_key(issue) == project_key
+      _ -> false
+    end) or
+      Enum.any?(state.retry_attempts, fn
+        {_issue_id, metadata} -> retry_project_group_key(metadata) == project_key
+        _ -> false
+      end)
+  end
+
+  defp retry_project_group_key(%{project_id: project_id}) when is_binary(project_id) and project_id != "", do: "id:" <> project_id
+  defp retry_project_group_key(%{project_slug: project_slug}) when is_binary(project_slug) and project_slug != "", do: "slug:" <> project_slug
+  defp retry_project_group_key(_metadata), do: nil
 
   defp project_issue_planner_module do
     Application.get_env(:symphony_elixir, :project_issue_planner, ProjectIssuePlanner)
@@ -696,22 +819,28 @@ defmodule SymphonyElixir.Orchestrator do
          %Issue{} = issue,
          %State{running: running, claimed: claimed} = state,
          active_states,
+         execution_states,
          terminal_states
        ) do
     if cheap_dispatch_candidate?(issue, state, running, claimed, active_states, terminal_states) do
-      case resolve_issue_dispatch(issue) do
-        {:ok, _issue_config, route} ->
-          worker_slots_available?(state, nil, route.backend)
-
-        {:error, _reason} ->
-          false
-      end
+      (preflight_dispatch_candidate?(issue) or execution_issue_state?(issue.state, execution_states)) and
+        issue_dispatch_route_available?(issue, state)
     else
       false
     end
   end
 
-  defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+  defp should_dispatch_issue?(_issue, _state, _active_states, _execution_states, _terminal_states), do: false
+
+  defp issue_dispatch_route_available?(issue, state) do
+    case resolve_issue_dispatch(issue) do
+      {:ok, _issue_config, route} ->
+        worker_slots_available?(state, nil, route.backend)
+
+      {:error, _reason} ->
+        false
+    end
+  end
 
   defp cheap_dispatch_candidate?(issue, state, running, claimed, active_states, terminal_states) do
     candidate_issue?(issue, active_states, terminal_states) and
@@ -868,6 +997,40 @@ defmodule SymphonyElixir.Orchestrator do
     MapSet.member?(active_states, normalize_issue_state(state_name))
   end
 
+  defp execution_issue_state?(state_name, execution_states) when is_binary(state_name) do
+    MapSet.member?(execution_states, normalize_issue_state(state_name))
+  end
+
+  defp execution_issue_state?(_state_name, _execution_states), do: false
+
+  defp preflight_issue_state?(state_name) when is_binary(state_name) do
+    MapSet.member?(preflight_state_set(), normalize_issue_state(state_name))
+  end
+
+  defp preflight_issue_state?(_state_name), do: false
+
+  defp preflight_dispatch_candidate?(%Issue{} = issue) do
+    preflight_issue_state?(issue.state) and preflight_required_label_present?(issue)
+  end
+
+  defp preflight_dispatch_candidate?(_issue), do: false
+
+  defp preflight_required_label_present?(%Issue{labels: labels}) when is_list(labels) do
+    case Config.settings!().tracker.preflight_required_label do
+      nil ->
+        true
+
+      required_label when is_binary(required_label) ->
+        normalized_required_label = normalize_label(required_label)
+        Enum.any?(labels, &(normalize_label(&1) == normalized_required_label))
+    end
+  end
+
+  defp preflight_required_label_present?(_issue), do: is_nil(Config.settings!().tracker.preflight_required_label)
+
+  defp normalize_label(label) when is_binary(label), do: label |> String.trim() |> String.downcase()
+  defp normalize_label(_label), do: ""
+
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(String.trim(state_name))
   end
@@ -886,8 +1049,25 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
+  defp execution_state_set do
+    Config.settings!().tracker.execution_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
+  defp preflight_state_set do
+    Config.settings!().tracker.preflight_states
+    |> Enum.map(&normalize_issue_state/1)
+    |> Enum.filter(&(&1 != ""))
+    |> MapSet.new()
+  end
+
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+    execution_states = execution_state_set()
+    terminal_states = terminal_state_set()
+
+    case prepare_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, execution_states, terminal_states) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
 
@@ -901,8 +1081,19 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:error, reason} ->
-        Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        Logger.warning("Skipping dispatch; issue preflight or refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+
+        schedule_issue_retry(
+          state,
+          issue.id,
+          next_retry_attempt_from_attempt(attempt),
+          %{
+            identifier: issue.identifier,
+            error: "issue preflight failed: #{inspect(reason)}",
+            worker_host: preferred_worker_host
+          }
+          |> Map.merge(retry_issue_metadata(issue))
+        )
     end
   end
 
@@ -1052,11 +1243,63 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
+  defp prepare_issue_for_dispatch(%Issue{} = issue, issue_fetcher, execution_states, terminal_states)
+       when is_function(issue_fetcher, 1) do
+    cond do
+      preflight_issue_state?(issue.state) ->
+        preflight_issue_for_dispatch(issue, issue_fetcher, execution_states, terminal_states)
+
+      true ->
+        revalidate_issue_for_dispatch(issue, issue_fetcher, execution_states, terminal_states)
+    end
+  end
+
+  defp prepare_issue_for_dispatch(issue, _issue_fetcher, _execution_states, _terminal_states), do: {:ok, issue}
+
+  defp preflight_issue_for_dispatch(%Issue{} = issue, issue_fetcher, execution_states, terminal_states) do
+    with :ok <- validate_preflight_candidate(issue, terminal_states),
+         :ok <- Tracker.create_comment(issue.id, preflight_comment_body(issue)),
+         :ok <- Tracker.update_issue_state(issue.id, Config.settings!().tracker.preflight_target_state) do
+      revalidate_issue_for_dispatch(issue, issue_fetcher, execution_states, terminal_states)
+    else
+      {:skip, _reason} ->
+        {:skip, issue}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_preflight_candidate(%Issue{} = issue, terminal_states) do
+    cond do
+      !issue_routable_to_worker?(issue) ->
+        {:skip, :not_routable}
+
+      todo_issue_blocked_by_non_terminal?(issue, terminal_states) ->
+        {:skip, :blocked_by_non_terminal}
+
+      !preflight_required_label_present?(issue) ->
+        {:skip, :missing_preflight_required_label}
+
+      match?({:ok, _issue_config, _route}, resolve_issue_dispatch(issue)) ->
+        :ok
+
+      true ->
+        {:error, :issue_config_resolution_failed}
+    end
+  end
+
+  defp preflight_comment_body(%Issue{} = issue) do
+    target_state = Config.settings!().tracker.preflight_target_state
+
+    "Symphony preflight checked #{issue.identifier || issue.id}: route/config and blocker eligibility passed. Promoting this issue to `#{target_state}` before agent execution."
+  end
+
+  defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, execution_states, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
       {:ok, [%Issue{} = refreshed_issue | _]} ->
-        if retry_candidate_issue?(refreshed_issue, terminal_states) do
+        if execution_candidate_issue?(refreshed_issue, execution_states, terminal_states) do
           {:ok, refreshed_issue}
         else
           {:skip, refreshed_issue}
@@ -1070,7 +1313,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+  defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _execution_states, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1344,7 +1587,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     case resolve_issue_dispatch(issue) do
       {:ok, _issue_config, route} ->
-        if retry_candidate_issue?(issue, terminal_state_set()) and
+        if retry_dispatch_candidate_issue?(issue, execution_state_set(), terminal_state_set()) and
+             retry_project_slots_available?(issue, state) and
              dispatch_slots_available?(issue, state) and
              worker_slots_available?(state, metadata[:worker_host], route.backend) do
           {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
@@ -1368,6 +1612,11 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Skipping retry dispatch; issue config resolution failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:noreply, release_issue_claim(state, issue.id)}
     end
+  end
+
+  defp retry_project_slots_available?(%Issue{} = issue, %State{} = state) do
+    project_key = issue_project_group_key(issue)
+    not project_has_active_work?(project_key, state)
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
@@ -2118,6 +2367,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
+  end
+
+  defp execution_candidate_issue?(%Issue{} = issue, execution_states, terminal_states) do
+    retry_candidate_issue?(issue, terminal_states) and
+      execution_issue_state?(issue.state, execution_states)
+  end
+
+  defp retry_dispatch_candidate_issue?(%Issue{} = issue, execution_states, terminal_states) do
+    retry_candidate_issue?(issue, terminal_states) and
+      (preflight_dispatch_candidate?(issue) or execution_issue_state?(issue.state, execution_states))
   end
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do

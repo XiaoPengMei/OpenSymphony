@@ -109,6 +109,11 @@ Minimal example:
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
+  active_states: [Todo, In Progress]
+  preflight_states: [Todo]
+  execution_states: [In Progress]
+  preflight_target_state: In Progress
+  preflight_required_label: agent-ready
 providers:
   openrouter_api_key: $OPENROUTER_API_KEY
 workspace:
@@ -219,6 +224,14 @@ Notes:
   lower value when both `symphony.yml` and `WORKFLOW.md` set `agent.max_turns`.
 - `tracker.project_slug` remains the legacy single-project shorthand when you explicitly start
   Symphony with a `WORKFLOW.md` path.
+- `tracker.active_states` controls the Linear poll pool. Issues in `tracker.preflight_states` are
+  eligible only for Symphony preflight: Symphony verifies route/blocker eligibility, writes a
+  preflight comment, moves the issue to `tracker.preflight_target_state`, then refetches it before
+  dispatch. Preflight issues do not create workspaces or start agents until the refetched state is
+  in `tracker.execution_states`.
+- `tracker.preflight_required_label` defaults to `agent-ready`. A preflight issue missing that label
+  is skipped without comment, state change, workspace creation, planner work, or agent token spend;
+  set it to `null` only if every issue in `tracker.preflight_states` should be auto-promoted.
 - `agent.backend` accepts `codex`, `opencode`, or `claude`. If omitted, Symphony infers the
   backend from a single configured provider block; ambiguous or empty provider config falls back to
   `codex`.
@@ -387,6 +400,17 @@ For the sample `symphony.yml`, `tracker.active_states` should contain:
 - `In Progress`
 - `Merging`
 - `Rework`
+
+Recommended two-stage execution split:
+
+- `tracker.preflight_states`: `Todo`
+- `tracker.execution_states`: `In Progress`, plus any other states that should already be safe to
+  run agents in.
+- `tracker.preflight_target_state`: `In Progress`
+- `tracker.preflight_required_label`: `agent-ready`
+
+This lets broad parent/tracking issues remain in `Todo` without being claimed: remove
+`agent-ready` from those tickets and Symphony will leave them untouched.
 
 Default terminal states recognized by Symphony are:
 

@@ -39,7 +39,7 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
         send(parent, {:issue_state_fetch, attempt})
 
         state =
-          if attempt == 1 do
+          if attempt in [1, 2] do
             "In Progress"
           else
             "Done"
@@ -70,7 +70,7 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
 
       trace = File.read!(trace_file)
       assert trace =~ "\"content\":\"/ulw-loop\\n\\nYou are an agent for this repository."
-      assert trace =~ "\"content\":\"Continuation guidance:\\n\\n- The previous agent turn completed normally, but the Linear issue is still in an active state."
+      assert trace =~ "\"content\":\"Continuation guidance:\\n\\n- The previous agent turn completed normally, but the Linear issue is still in an execution state."
       assert trace =~ "continuation turn #2 of 3"
     after
       Process.delete(:claude_agent_turn_fetch_count)
@@ -78,7 +78,7 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
     end
   end
 
-  test "agent runner stops after one turn when issue leaves active states" do
+  test "agent runner stops after one turn when issue leaves execution states" do
     test_root = temp_root!("nonactive-stop")
     trace_env = "SYMP_TEST_CLAUDE_TRACE_#{System.unique_integer([:positive])}"
     scenario_env = "SYMP_TEST_CLAUDE_SCENARIO_#{System.unique_integer([:positive])}"
@@ -116,7 +116,9 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
         Process.put(:claude_agent_in_review_fetch_count, attempt)
         send(parent, {:issue_state_fetch, attempt})
 
-        {:ok, [%{issue | state: "In Review"}]}
+        state = if attempt == 1, do: "In Progress", else: "In Review"
+
+        {:ok, [%{issue | state: state}]}
       end
 
       assert :ok = AgentRunner.run(issue, self(), issue_state_fetcher: state_fetcher)
@@ -125,7 +127,8 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
       assert File.exists?(Path.join(workspace_path, ".symphony/claude/mcp.json"))
 
       assert_receive {:issue_state_fetch, 1}, 1_000
-      refute_receive {:issue_state_fetch, 2}, 200
+      assert_receive {:issue_state_fetch, 2}, 1_000
+      refute_receive {:issue_state_fetch, 3}, 200
 
       trace = File.read!(trace_file)
       assert trace =~ "\"content\":\"/ulw-loop\\n\\nYou are an agent for this repository."

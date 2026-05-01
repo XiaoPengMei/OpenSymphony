@@ -110,19 +110,64 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
     end
   end
 
-  test "validates a complete ordered plan" do
+  defmodule HangingPlannerOpenCodePlug do
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, _opts) do
+      case {conn.method, String.split(conn.request_path, "/", trim: true)} do
+        {"GET", ["global", "health"]} ->
+          json(conn, 200, %{"healthy" => true})
+
+        {"GET", ["global", "event"]} ->
+          conn
+          |> put_resp_header("content-type", "text/event-stream")
+          |> put_resp_header("cache-control", "no-cache")
+          |> send_chunked(200)
+          |> wait_for_disconnect()
+
+        {"POST", ["session"]} ->
+          json(conn, 200, %{"id" => "planner-session"})
+
+        {"POST", ["session", _session_id, "message"]} ->
+          Process.sleep(12_000)
+          json(conn, 500, %{"error" => "late planner response"})
+
+        _ ->
+          send_resp(conn, 404, "not found")
+      end
+    end
+
+    defp wait_for_disconnect(conn) do
+      receive do
+        :close -> conn
+      after
+        30_000 -> conn
+      end
+    end
+
+    defp json(conn, status, body) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(status, Jason.encode!(body))
+    end
+  end
+
+  test "validates a complete wave plan" do
     issues = [issue("issue-a"), issue("issue-b")]
 
     plan = %{
       "schema_version" => 1,
       "project_key" => "id:project-1",
       "batches" => [
-        %{"parallel_group" => 1, "issue_ids" => ["issue-b", "issue-a"], "reason" => "safe order"}
+        %{"parallel_group" => 1, "issue_ids" => ["issue-b"], "reason" => "first wave"},
+        %{"parallel_group" => 2, "issue_ids" => ["issue-a"], "reason" => "second wave"}
       ],
       "defer_issue_ids" => []
     }
 
-    assert {:ok, ["issue-b", "issue-a"]} = ProjectIssuePlanner.validate_plan("id:project-1", issues, plan)
+    assert {:ok, [["issue-b"], ["issue-a"]]} = ProjectIssuePlanner.validate_plan("id:project-1", issues, plan)
   end
 
   test "validates plans encoded as JSON" do
@@ -136,7 +181,20 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
         "defer_issue_ids" => []
       })
 
-    assert {:ok, ["issue-a"]} = ProjectIssuePlanner.validate_plan("id:project-1", issues, plan)
+    assert {:ok, [["issue-a"]]} = ProjectIssuePlanner.validate_plan("id:project-1", issues, plan)
+  end
+
+  test "splits same-surface issues out of an overly broad planner wave" do
+    issues = [
+      issue("issue-android-a", title: "安卓版本控制"),
+      issue("issue-web", title: "web端添加安卓下载页面"),
+      issue("issue-android-b", title: "安卓生命周期 + 导航栈管理功能调整")
+    ]
+
+    plan = valid_plan(["issue-android-a", "issue-web", "issue-android-b"])
+
+    assert {:ok, [["issue-android-a", "issue-web"], ["issue-android-b"]]} =
+             ProjectIssuePlanner.validate_plan("id:project-1", issues, plan)
   end
 
   test "rejects malformed JSON" do
@@ -172,7 +230,7 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
              ProjectIssuePlanner.validate_plan("id:project-1", [issue("issue-a"), issue("issue-b")], plan)
   end
 
-  test "runs OpenCode planner and extracts structured output order" do
+  test "runs OpenCode planner and extracts structured output waves" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -194,7 +252,7 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
         opencode_agent: "sisyphus"
       )
 
-      assert {:ok, ["issue-b", "issue-a"]} =
+      assert {:ok, [["issue-b", "issue-a"]]} =
                ProjectIssuePlanner.plan_project_issues("id:project-1", [issue("issue-a"), issue("issue-b")])
 
       assert_receive {:fake_planner_opencode_request, {:session_create, %{"title" => title}}}, 1_000
@@ -218,6 +276,35 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
     end
   end
 
+  @tag timeout: 30_000
+  test "planner turn timeout returns an error instead of blocking the orchestrator" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-project-planner-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(workspace_root)
+
+      bandit = start_supervised!({Bandit, plug: HangingPlannerOpenCodePlug, port: 0})
+      {:ok, {_ip, port}} = ThousandIsland.listener_info(bandit)
+      launcher = write_opencode_launcher_script!(test_root, "http://127.0.0.1:#{port}")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        opencode_agent: "sisyphus"
+      )
+
+      assert {:error, reason} = ProjectIssuePlanner.plan_project_issues("id:project-1", [issue("issue-a")])
+      assert reason == :planner_timeout or match?(%{kind: :event_stream_timeout}, reason)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   defp valid_plan(issue_ids, opts \\ []) do
     %{
       "schema_version" => 1,
@@ -227,8 +314,16 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
     }
   end
 
-  defp issue(id) do
-    %Issue{id: id, identifier: String.upcase(id), title: id, state: "Todo", project_id: "project-1"}
+  defp issue(id, opts \\ []) do
+    %Issue{
+      id: id,
+      identifier: String.upcase(id),
+      title: Keyword.get(opts, :title, id),
+      description: Keyword.get(opts, :description),
+      labels: Keyword.get(opts, :labels, []),
+      state: "Todo",
+      project_id: "project-1"
+    }
   end
 
   defp start_fake_planner_opencode_server!(plan) do

@@ -261,7 +261,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_codex_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_codex_turn_prompt(issue, opts, 1, _max_turns), do: build_issue_execution_prompt(issue, opts)
 
   defp build_codex_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -275,7 +275,7 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp build_agent_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_agent_turn_prompt(issue, opts, 1, _max_turns), do: build_issue_execution_prompt(issue, opts)
 
   defp build_agent_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -287,6 +287,10 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp build_issue_execution_prompt(issue, opts) do
+    "/ulw-loop\n\n" <> PromptBuilder.build_prompt(issue, opts)
   end
 
   defp prepare_workspace_for_backend(workspace, worker_host, backend, issue_config) do

@@ -210,6 +210,7 @@ defmodule SymphonyElixir.ProjectIssuePlannerTest do
                      1_000
 
       assert prompt_text =~ "Project key: id:project-1"
+      refute String.starts_with?(prompt_text, "/ulw-loop")
       assert prompt_text =~ "issue-a"
       assert prompt_text =~ "issue-b"
     after

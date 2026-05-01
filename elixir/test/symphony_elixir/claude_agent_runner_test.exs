@@ -69,7 +69,7 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
                      1_000
 
       trace = File.read!(trace_file)
-      assert trace =~ "\"content\":\"You are an agent for this repository."
+      assert trace =~ "\"content\":\"/ulw-loop\\n\\nYou are an agent for this repository."
       assert trace =~ "\"content\":\"Continuation guidance:\\n\\n- The previous agent turn completed normally, but the Linear issue is still in an active state."
       assert trace =~ "continuation turn #2 of 3"
     after
@@ -128,6 +128,7 @@ defmodule SymphonyElixir.ClaudeAgentRunnerTest do
       refute_receive {:issue_state_fetch, 2}, 200
 
       trace = File.read!(trace_file)
+      assert trace =~ "\"content\":\"/ulw-loop\\n\\nYou are an agent for this repository."
       assert trace =~ "You are an agent for this repository."
       refute trace =~ "Continuation guidance"
       refute trace =~ "continuation turn #2"

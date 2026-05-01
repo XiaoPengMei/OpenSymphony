@@ -2021,7 +2021,9 @@ defmodule SymphonyElixir.CoreTest do
         |> Enum.map(&message_text/1)
 
       assert length(prompts) == 2
+      assert String.starts_with?(Enum.at(prompts, 0), "/ulw-loop\n\n")
       assert Enum.at(prompts, 0) =~ "You are an agent for this repository."
+      refute String.starts_with?(Enum.at(prompts, 1), "/ulw-loop")
       refute Enum.at(prompts, 1) =~ "You are an agent for this repository."
       assert Enum.at(prompts, 1) =~ "Continuation guidance:"
       assert Enum.at(prompts, 1) =~ "continuation turn #2 of 3"

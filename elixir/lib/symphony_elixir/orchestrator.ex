@@ -1004,7 +1004,8 @@ defmodule SymphonyElixir.Orchestrator do
             project_name: project_name,
             labels: labels,
             backend: backend,
-            effort: effort
+            effort: effort,
+            failure_started_at_ms: pick_retry_failure_started_at_ms(previous_retry, metadata)
           })
     }
   end
@@ -1024,7 +1025,8 @@ defmodule SymphonyElixir.Orchestrator do
           project_name: Map.get(retry_entry, :project_name),
           labels: Map.get(retry_entry, :labels, []),
           backend: Map.get(retry_entry, :backend),
-          effort: Map.get(retry_entry, :effort)
+          effort: Map.get(retry_entry, :effort),
+          failure_started_at_ms: Map.get(retry_entry, :failure_started_at_ms)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1065,7 +1067,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) ->
-        case maybe_enforce_completion(issue, metadata[:workspace_path]) do
+        case maybe_enforce_completion_after_failure_grace(issue, metadata[:workspace_path], metadata) do
           {:ok, :completed} ->
             {:noreply,
              state
@@ -1174,6 +1176,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_enforce_completion(_issue_or_entry, _workspace_path), do: {:ok, :missing_workspace}
 
+  defp maybe_enforce_completion_after_failure_grace(%Issue{} = issue, workspace_path, metadata) when is_map(metadata) do
+    if failure_completion_grace_elapsed?(metadata) do
+      maybe_enforce_completion(issue, workspace_path)
+    else
+      {:ok, :failure_grace_active}
+    end
+  end
+
+  defp maybe_enforce_completion_after_failure_grace(%Issue{} = issue, workspace_path, _metadata) do
+    maybe_enforce_completion(issue, workspace_path)
+  end
+
   defp cleanup_issue_workspace(issue_or_identifier, worker_host \\ nil)
 
   defp cleanup_issue_workspace(issue_or_identifier, worker_host) do
@@ -1236,6 +1250,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     cond do
+      failure_grace_retry_delay_ms(metadata) > 0 ->
+        failure_grace_retry_delay_ms(metadata)
+
       is_integer(metadata[:delay_ms]) and metadata[:delay_ms] > 0 ->
         min(metadata[:delay_ms], Config.settings!().agent.max_retry_backoff_ms)
 
@@ -1288,6 +1305,38 @@ defmodule SymphonyElixir.Orchestrator do
   defp pick_retry_value(previous_retry, metadata, key) when is_atom(key) do
     Map.get(metadata, key) || Map.get(previous_retry, key)
   end
+
+  defp pick_retry_failure_started_at_ms(previous_retry, metadata) do
+    cond do
+      is_integer(metadata[:failure_started_at_ms]) -> metadata[:failure_started_at_ms]
+      failure_retry_metadata?(metadata) -> System.monotonic_time(:millisecond)
+      is_integer(Map.get(previous_retry, :failure_started_at_ms)) -> Map.get(previous_retry, :failure_started_at_ms)
+      true -> nil
+    end
+  end
+
+  defp failure_retry_metadata?(metadata) when is_map(metadata) do
+    metadata[:delay_type] != :continuation and is_binary(metadata[:error]) and metadata[:error] != ""
+  end
+
+  defp failure_retry_metadata?(_metadata), do: false
+
+  defp failure_completion_grace_elapsed?(metadata) when is_map(metadata) do
+    failure_grace_retry_delay_ms(metadata) <= 0
+  end
+
+  defp failure_grace_retry_delay_ms(metadata) when is_map(metadata) do
+    started_at_ms = metadata[:failure_started_at_ms]
+    grace_ms = Config.settings!().completion.failure_grace_ms
+
+    if is_integer(started_at_ms) and is_integer(grace_ms) and grace_ms > 0 do
+      max(0, started_at_ms + grace_ms - System.monotonic_time(:millisecond))
+    else
+      0
+    end
+  end
+
+  defp failure_grace_retry_delay_ms(_metadata), do: 0
 
   defp retry_issue_metadata(%{issue: %Issue{} = issue} = running_entry) do
     issue

@@ -1007,6 +1007,85 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "failed worker retry waits for completion grace before marker promotion" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-elixir-completion-failure-grace-#{System.unique_integer([:positive])}")
+    issue_id = "issue-complete-failure-grace"
+    issue_identifier = "MT-571"
+    retry_token = make_ref()
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true,
+        completion_failure_grace_ms: 5_000
+      )
+
+      File.mkdir_p!(Path.join(workspace, ".symphony"))
+      File.write!(Path.join(workspace, ".symphony/complete"), "done\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+        %Issue{id: issue_id, identifier: issue_identifier, title: "Grace retry", state: "In Progress"}
+      ])
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{
+          issue_id => %{
+            attempt: 1,
+            retry_token: retry_token,
+            timer_ref: nil,
+            due_at_ms: System.monotonic_time(:millisecond),
+            identifier: issue_identifier,
+            error: "agent exited: :boom",
+            workspace_path: workspace,
+            failure_started_at_ms: System.monotonic_time(:millisecond)
+          }
+        },
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 0
+      }
+
+      assert {:noreply, updated_state} =
+               Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert %{attempt: 2, due_at_ms: due_at_ms, failure_started_at_ms: failure_started_at_ms} = updated_state.retry_attempts[issue_id]
+      assert is_integer(failure_started_at_ms)
+      assert_due_in_range(due_at_ms, 4_500, 5_500)
+      refute_received {:memory_tracker_state_update, ^issue_id, "In Review"}
+
+      expired_retry_token = make_ref()
+
+      expired_state = %{
+        updated_state
+        | retry_attempts: %{
+            issue_id => %{
+              updated_state.retry_attempts[issue_id]
+              | retry_token: expired_retry_token,
+                due_at_ms: System.monotonic_time(:millisecond),
+                failure_started_at_ms: System.monotonic_time(:millisecond) - 5_001
+            }
+          }
+      }
+
+      assert {:noreply, completed_state} =
+               Orchestrator.handle_info({:retry_issue, issue_id, expired_retry_token}, expired_state)
+
+      refute MapSet.member?(completed_state.claimed, issue_id)
+      refute Map.has_key?(completed_state.retry_attempts, issue_id)
+      assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 1_000
+    after
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "continuation retry cleans workspace when issue is terminal" do
     test_root =
       Path.join(

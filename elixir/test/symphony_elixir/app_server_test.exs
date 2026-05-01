@@ -246,7 +246,7 @@ defmodule SymphonyElixir.AppServerTest do
           json(conn, 200, %{"info" => %{"id" => "assistant-message-5", "sessionID" => session_id}})
 
         :message_post_timeout ->
-          Enum.each(1..10, fn step ->
+          Enum.each(1..20, fn step ->
             FakeOpenCodeState.broadcast(state, "message.part.delta", %{
               "part" => %{
                 "sessionID" => session_id,
@@ -430,6 +430,48 @@ defmodule SymphonyElixir.AppServerTest do
       assert_receive {:agent_message, %{event: "message.part.updated", usage: %{input: 7, output: 2, reasoning: 1, total: 10}}}, 1_000
       assert_receive {:agent_message, %{event: "message.updated", usage: %{input: 12, output: 4, reasoning: 3, total: 19}}}, 1_000
       assert_receive {:agent_message, %{event: :turn_completed, usage: %{input: 12, output: 4, reasoning: 3, total: 19}}}, 1_000
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server posts UTF-8 prompt text to OpenCode" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-opencode-utf8-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "CRZ-6")
+      File.mkdir_p!(workspace)
+
+      server = start_fake_opencode_server!({:success, workspace})
+      launcher = write_launcher_script!(test_root, server.base_url)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        opencode_command: launcher,
+        opencode_agent: "build"
+      )
+
+      prompt = "# Sensia OpenSymphony workflow 你正在处理 Sensia Inventory\n\n请修复 CRZ-6"
+
+      assert {:ok, _result} =
+               AppServer.run(
+                 workspace,
+                 prompt,
+                 issue_fixture("issue-unicode", "CRZ-6", "中文标题")
+               )
+
+      assert_receive {:fake_opencode_request,
+                      {:message_post, "session-test",
+                       %{
+                         "agent" => "build",
+                         "parts" => [%{"type" => "text", "text" => ^prompt}]
+                       }}},
+                     1_000
     after
       File.rm_rf(test_root)
     end
@@ -632,7 +674,7 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         opencode_command: launcher,
-        opencode_read_timeout_ms: 500,
+        opencode_read_timeout_ms: 1_000,
         opencode_stall_timeout_ms: 5_000
       )
 
@@ -641,7 +683,7 @@ defmodule SymphonyElixir.AppServerTest do
                 kind: :message_post_timeout,
                 phase: :post_turn_message,
                 session_id: "session-test",
-                read_timeout_ms: 500,
+                read_timeout_ms: 1_000,
                 method: "POST",
                 path: "/session/session-test/message",
                 message: message,

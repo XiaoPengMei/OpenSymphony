@@ -423,7 +423,8 @@ defmodule SymphonyElixir.OpenCode.AppServer do
 
     case Req.post(session.request,
            url: path,
-           json: payload
+           body: Jason.encode!(payload),
+           headers: %{"content-type" => "application/json"}
          ) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
         {:ok, body}

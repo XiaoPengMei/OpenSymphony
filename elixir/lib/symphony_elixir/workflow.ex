@@ -85,7 +85,11 @@ defmodule SymphonyElixir.Workflow do
   end
 
   defp split_front_matter(content) do
-    lines = String.split(content, ~r/\R/, trim: false)
+    lines =
+      content
+      |> String.replace("\r\n", "\n")
+      |> String.replace("\r", "\n")
+      |> String.split("\n", trim: false)
 
     case lines do
       ["---" | tail] ->

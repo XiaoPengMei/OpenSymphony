@@ -5,24 +5,92 @@ defmodule SymphonyElixir.PromptBuilder do
 
   alias SymphonyElixir.{Config, IssueConfig, Workflow}
 
-  @render_opts [strict_variables: true, strict_filters: true]
-
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
-    template =
-      resolve_prompt_template(issue, opts)
-      |> parse_template!()
+    prompt_template = resolve_prompt_template(issue, opts)
+    _validated_template = parse_template!(prompt_template)
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.chardata_to_string()
+    render_prompt_template!(prompt_template, %{
+      "attempt" => Keyword.get(opts, :attempt),
+      "issue" => issue |> Map.from_struct() |> to_solid_map()
+    })
   end
+
+  defp render_prompt_template!(prompt_template, assigns) when is_binary(prompt_template) do
+    prompt_template
+    |> render_condition_blocks!(assigns)
+    |> render_variable_tags!(assigns)
+  end
+
+  defp render_condition_blocks!(prompt_template, assigns) when is_binary(prompt_template) do
+    prompt_template =
+      Regex.replace(
+        ~r/\{%\s*if\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*%\}(.*?)\{%\s*else\s*%\}(.*?)\{%\s*endif\s*%\}/s,
+        prompt_template,
+        fn _match, path, truthy_body, falsey_body ->
+          value = fetch_assign_path!(assigns, String.split(path, "."), path)
+
+          if truthy?(value) do
+            truthy_body
+          else
+            falsey_body
+          end
+        end
+      )
+
+    Regex.replace(~r/\{%\s*if\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*%\}(.*?)\{%\s*endif\s*%\}/s, prompt_template, fn _match, path, body ->
+      value = fetch_assign_path!(assigns, String.split(path, "."), path)
+
+      if truthy?(value) do
+        body
+      else
+        ""
+      end
+    end)
+  end
+
+  defp render_variable_tags!(prompt_template, assigns) when is_binary(prompt_template) do
+    Regex.replace(~r/\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\}\}/, prompt_template, fn _match, path ->
+      assigns
+      |> fetch_assign_path!(String.split(path, "."), path)
+      |> to_prompt_text()
+    end)
+  end
+
+  defp fetch_assign_path!(value, [], _path), do: value
+
+  defp fetch_assign_path!(%{} = value, [segment | rest], path) do
+    case Map.fetch(value, segment) do
+      {:ok, child} -> fetch_assign_path!(child, rest, path)
+      :error -> raise_undefined_variable!(path)
+    end
+  end
+
+  defp fetch_assign_path!(_value, _segments, path), do: raise_undefined_variable!(path)
+
+  defp raise_undefined_variable!(path) do
+    raise Solid.RenderError,
+      errors: [
+        %Solid.UndefinedVariableError{
+          variable: path,
+          original_name: path,
+          loc: %{line: 1}
+        }
+      ],
+      result: []
+  end
+
+  defp truthy?(nil), do: false
+  defp truthy?(false), do: false
+  defp truthy?(_value), do: true
+
+  defp to_prompt_text(nil), do: ""
+  defp to_prompt_text(value) when is_binary(value), do: value
+  defp to_prompt_text(value) when is_integer(value), do: Integer.to_string(value)
+  defp to_prompt_text(value) when is_float(value), do: Float.to_string(value)
+  defp to_prompt_text(value) when is_boolean(value), do: to_string(value)
+  defp to_prompt_text(value) when is_list(value), do: Enum.map_join(value, "", &to_prompt_text/1)
+  defp to_prompt_text(value), do: to_string(value)
 
   defp resolve_prompt_template(issue, opts) do
     case Keyword.get(opts, :issue_config) do

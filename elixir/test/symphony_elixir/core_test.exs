@@ -1258,6 +1258,72 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "completion sweep stops running candidate when marker exists" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-sweep-running-#{System.unique_integer([:positive])}"
+      )
+
+    running_issue = %Issue{
+      id: "issue-sweep-running",
+      identifier: "MT-569-RUNNING",
+      title: "Sweep running",
+      state: "In Progress"
+    }
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["In Progress"],
+        completion_enabled: true
+      )
+
+      running_workspace = Path.join(test_root, running_issue.identifier)
+      File.mkdir_p!(Path.join(running_workspace, ".symphony"))
+      File.write!(Path.join(running_workspace, ".symphony/complete"), "done\n")
+
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      running_entry = %{
+        pid: worker_pid,
+        ref: make_ref(),
+        identifier: running_issue.identifier,
+        issue: running_issue,
+        workspace_path: running_workspace,
+        started_at: DateTime.utc_now()
+      }
+
+      state = %Orchestrator.State{
+        running: %{running_issue.id => running_entry},
+        claimed: MapSet.new([running_issue.id]),
+        agent_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        max_concurrent_agents: 1
+      }
+
+      assert {[], updated_state} = Orchestrator.sweep_candidate_completions_for_test([running_issue], state)
+
+      refute Process.alive?(worker_pid)
+      refute Map.has_key?(updated_state.running, running_issue.id)
+      refute MapSet.member?(updated_state.claimed, running_issue.id)
+      assert MapSet.member?(updated_state.completed, running_issue.id)
+      assert_receive {:memory_tracker_state_update, "issue-sweep-running", "In Review"}, 1_000
+      assert_receive {:memory_tracker_comment, "issue-sweep-running", _comment}, 1_000
+    after
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
+      Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "completion sweep skips claimed and missing-marker candidates" do
     test_root =
       Path.join(

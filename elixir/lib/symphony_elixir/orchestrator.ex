@@ -650,7 +650,10 @@ defmodule SymphonyElixir.Orchestrator do
       MapSet.member?(state.completed, issue_id) ->
         {:completed, state}
 
-      MapSet.member?(state.claimed, issue_id) or Map.has_key?(state.running, issue_id) ->
+      Map.has_key?(state.running, issue_id) ->
+        maybe_complete_running_issue(issue, state, settings)
+
+      MapSet.member?(state.claimed, issue_id) ->
         :skip
 
       true ->
@@ -670,6 +673,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp sweep_candidate_completion(_issue, _state, _settings), do: :skip
+
+  defp maybe_complete_running_issue(%Issue{id: issue_id} = issue, %State{} = state, settings) do
+    running_entry = Map.get(state.running, issue_id)
+    workspace_path = Map.get(running_entry, :workspace_path)
+
+    case CompletionEnforcer.enforce(issue, workspace_path, settings) do
+      {:ok, :completed} ->
+        Logger.info("Completion sweep stopped active worker after marker promotion #{issue_context(issue)} workspace=#{workspace_path}")
+
+        updated_state =
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> complete_issue(issue_id)
+
+        {:completed, updated_state}
+
+      _ ->
+        :skip
+    end
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
